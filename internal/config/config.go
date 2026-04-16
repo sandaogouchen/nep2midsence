@@ -4,24 +4,37 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"gopkg.in/yaml.v3"
 )
 
-// Config holds the full configuration for the migration tool
+const defaultConfigPath = ".nep2midsence.yaml"
+
 type Config struct {
-	Source         SourceConfig              `json:"source" yaml:"source"`
-	Target         TargetConfig              `json:"target" yaml:"target"`
-	Analysis       AnalysisConfig            `json:"analysis" yaml:"analysis"`
-	CustomMappings map[string]*CustomMapping `json:"custom_mappings" yaml:"custom_mappings"`
-	Coco           CocoConfig                `json:"coco" yaml:"coco"`
-	Execution      ExecutionConfig           `json:"execution" yaml:"execution"`
-	MigrationDoc   string                    `json:"migration_doc" yaml:"migration_doc"`
+	Source         SourceConfig      `json:"source" yaml:"source"`
+	Target         TargetConfig      `json:"target" yaml:"target"`
+	Analysis       AnalysisConfig    `json:"analysis" yaml:"analysis"`
+	CustomMappings map[string]string `json:"custom_mappings" yaml:"custom_mappings"`
+	Coco           CocoConfig        `json:"coco" yaml:"coco"`
+	Execution      ExecutionConfig   `json:"execution" yaml:"execution"`
+	MigrationDoc   string            `json:"migration_doc" yaml:"migration_doc"`
+	TSExtractor    TSExtractorConfig `json:"ts_extractor" yaml:"ts_extractor"`
+	Fingerprint    FingerprintConfig `json:"fingerprint" yaml:"fingerprint"`
+	SourceDir      string            `json:"source_dir" yaml:"source_dir"`
+	Workers        int               `json:"workers" yaml:"workers"`
+	configPath     string            `json:"-" yaml:"-"`
 }
 
 type SourceConfig struct {
-	FilePatterns    []string `json:"file_patterns" yaml:"file_patterns"`
-	PackagePrefixes []string `json:"package_prefixes" yaml:"package_prefixes"`
+	Dir             string            `json:"dir" yaml:"dir"`
+	Extensions      []string          `json:"extensions" yaml:"extensions"`
+	Pattern         string            `json:"pattern" yaml:"pattern"`
+	Exclude         []string          `json:"exclude" yaml:"exclude"`
+	Language        string            `json:"language" yaml:"language"`
+	FilePatterns    []string          `json:"file_patterns" yaml:"file_patterns"`
+	PackagePrefixes []string          `json:"package_prefixes" yaml:"package_prefixes"`
+	CustomMappings  map[string]string `json:"custom_mappings" yaml:"custom_mappings"`
 }
 
 type TargetConfig struct {
@@ -31,13 +44,9 @@ type TargetConfig struct {
 
 type AnalysisConfig struct {
 	MaxCallDepth   int  `json:"max_call_depth" yaml:"max_call_depth"`
+	MaxFiles       int  `json:"max_files" yaml:"max_files"`
 	EnableDataflow bool `json:"enable_dataflow" yaml:"enable_dataflow"`
 	EnableIntent   bool `json:"enable_intent" yaml:"enable_intent"`
-}
-
-type CustomMapping struct {
-	MidsceneEquivalent string `json:"midscene_equivalent" yaml:"midscene_equivalent"`
-	NeedsIntentRewrite bool   `json:"needs_intent_rewrite" yaml:"needs_intent_rewrite"`
 }
 
 type CocoConfig struct {
@@ -52,68 +61,103 @@ type ExecutionConfig struct {
 	MaxJobs    int `json:"max_jobs" yaml:"max_jobs"`
 }
 
-// DefaultConfig returns a config with sensible defaults
+type TSExtractorConfig struct {
+	NodePath   string `json:"node_path" yaml:"node_path"`
+	ScriptPath string `json:"script_path" yaml:"script_path"`
+	Timeout    int    `json:"timeout" yaml:"timeout"`
+}
+
+type FingerprintConfig struct {
+	CustomMappings map[string]string `json:"custom_mappings" yaml:"custom_mappings"`
+}
+
 func DefaultConfig() *Config {
 	return &Config{
 		Source: SourceConfig{
-			FilePatterns:    []string{"*_test.go"},
-			PackagePrefixes: []string{"nep"},
+			Dir: ".", Extensions: []string{".ts"}, Pattern: "**/*",
+			Exclude: []string{"node_modules", "dist"}, Language: "typescript",
+			FilePatterns: []string{}, PackagePrefixes: []string{},
+			CustomMappings: make(map[string]string),
 		},
-		Target: TargetConfig{
-			OutputDir:  "midscene",
-			FileSuffix: "_midscene",
-		},
-		Analysis: AnalysisConfig{
-			MaxCallDepth:   5,
-			EnableDataflow: true,
-			EnableIntent:   true,
-		},
-		Coco: CocoConfig{
-			MaxTurns:     10,
-			AllowedTools: []string{"Read", "Write", "Edit", "Bash"},
-			Timeout:      "3m",
-			OutputFormat: "json",
-		},
-		Execution: ExecutionConfig{
-			RetryLimit: 2,
-			MaxJobs:    1,
-		},
+		Target:   TargetConfig{OutputDir: "output", FileSuffix: "_converted"},
+		Analysis: AnalysisConfig{MaxCallDepth: 5, MaxFiles: 50, EnableDataflow: true, EnableIntent: true},
+		CustomMappings: make(map[string]string),
+		Coco: CocoConfig{MaxTurns: 10, AllowedTools: []string{}, Timeout: "30s", OutputFormat: "json"},
+		Execution:   ExecutionConfig{RetryLimit: 3, MaxJobs: 4},
+		MigrationDoc: "",
+		TSExtractor: TSExtractorConfig{NodePath: "node", ScriptPath: "scripts/dist/ts-ast-extractor.js", Timeout: 30},
+		Fingerprint: FingerprintConfig{CustomMappings: make(map[string]string)},
+		SourceDir: ".", Workers: 4,
 	}
 }
 
-// Load reads config from a file path; if empty, tries .nep2midsence.yaml then falls back to defaults
 func Load(path string) (*Config, error) {
-	if path == "" {
-		// Try default locations (new name first, legacy fallback)
-		candidates := []string{
-			".nep2midsence.yaml", ".nep2midsence.yml", ".nep2midsence.json",
-			".casemover.yaml", ".casemover.yml", ".casemover.json",
+	cfg := DefaultConfig()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading config file: %w", err)
+	}
+	ext := filepath.Ext(path)
+	switch ext {
+	case ".yaml", ".yml":
+		if err := yaml.Unmarshal(data, cfg); err != nil {
+			return nil, fmt.Errorf("parsing YAML config: %w", err)
 		}
-		for _, c := range candidates {
-			if _, err := os.Stat(c); err == nil {
-				path = c
-				break
+	case ".json":
+		if err := json.Unmarshal(data, cfg); err != nil {
+			return nil, fmt.Errorf("parsing JSON config: %w", err)
+		}
+	default:
+		if err := yaml.Unmarshal(data, cfg); err != nil {
+			if err2 := json.Unmarshal(data, cfg); err2 != nil {
+				return nil, fmt.Errorf("unable to parse config as YAML (%v) or JSON (%v)", err, err2)
 			}
 		}
 	}
+	cfg.configPath = path
+	return cfg, nil
+}
 
-	cfg := DefaultConfig()
-	if path == "" {
-		// No config file found, use defaults
-		return cfg, nil
-	}
-
+func (c *Config) LoadFile(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("reading config file %s: %w", path, err)
+		return fmt.Errorf("reading config file: %w", err)
 	}
-
-	// Try YAML first, then JSON
-	if err := yaml.Unmarshal(data, cfg); err != nil {
-		if err2 := json.Unmarshal(data, cfg); err2 != nil {
-			return nil, fmt.Errorf("parsing config file %s: yaml: %w, json: %v", path, err, err2)
+	ext := filepath.Ext(path)
+	switch ext {
+	case ".yaml", ".yml":
+		if err := yaml.Unmarshal(data, c); err != nil {
+			return fmt.Errorf("parsing YAML config: %w", err)
+		}
+	case ".json":
+		if err := json.Unmarshal(data, c); err != nil {
+			return fmt.Errorf("parsing JSON config: %w", err)
+		}
+	default:
+		if err := yaml.Unmarshal(data, c); err != nil {
+			if err2 := json.Unmarshal(data, c); err2 != nil {
+				return fmt.Errorf("unable to parse config as YAML (%v) or JSON (%v)", err, err2)
+			}
 		}
 	}
+	c.configPath = path
+	return nil
+}
 
-	return cfg, nil
+func (c *Config) Reset() {
+	def := DefaultConfig()
+	*c = *def
+}
+
+func (c *Config) ToMap() map[string]interface{} {
+	keys := c.GetAllKeys()
+	m := make(map[string]interface{}, len(keys))
+	for _, k := range keys {
+		v, err := c.Get(k)
+		if err != nil {
+			continue
+		}
+		m[k] = v
+	}
+	return m
 }
