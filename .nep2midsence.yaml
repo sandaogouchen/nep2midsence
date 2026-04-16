@@ -1,4 +1,4 @@
-# CaseMover 配置文件示例
+# nep2midsence 配置文件示例
 source:
   framework: "nep"
   package_prefixes:

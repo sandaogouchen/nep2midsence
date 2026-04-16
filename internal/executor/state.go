@@ -26,7 +26,7 @@ type MigrationState struct {
 
 // NewStateStore creates or loads a state store at the given path
 func NewStateStore(dir string) (*StateStore, error) {
-	fp := filepath.Join(dir, ".casemover-state.json")
+	fp := filepath.Join(dir, ".nep2midsence-state.json")
 	store := &StateStore{
 		filePath: fp,
 		state: &MigrationState{
