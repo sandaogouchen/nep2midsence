@@ -1,0 +1,39 @@
+# CaseMover 配置文件示例
+source:
+  framework: "nep"
+  package_prefixes:
+    - "github.com/xxx/nep"
+    - "github.com/xxx/nep-utils"
+  file_patterns:
+    - "*_test.go"
+    - "*_e2e.go"
+
+target:
+  framework: "midscene"
+  output_dir: "midscene"
+  file_suffix: ""
+
+coco:
+  max_turns: 15
+  timeout: "3m"
+  allowed_tools:
+    - "Read"
+    - "Write"
+    - "Edit"
+    - "Bash"
+  output_format: "json"
+
+analysis:
+  max_call_depth: 5
+  enable_dataflow: true
+  enable_intent: true
+
+execution:
+  concurrency: 2
+  retry_limit: 1
+  complexity_turns:
+    simple: 10
+    medium: 20
+    complex: 30
+
+migration_doc: "docs/nep_to_midscene_guide.md"
