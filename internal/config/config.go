@@ -81,11 +81,14 @@ func DefaultConfig() *Config {
 	}
 }
 
-// Load reads config from a file path; if empty, tries .casemover.yaml then falls back to defaults
+// Load reads config from a file path; if empty, tries .nep2midsence.yaml then falls back to defaults
 func Load(path string) (*Config, error) {
 	if path == "" {
-		// Try default locations
-		candidates := []string{".casemover.yaml", ".casemover.yml", ".casemover.json"}
+		// Try default locations (new name first, legacy fallback)
+		candidates := []string{
+			".nep2midsence.yaml", ".nep2midsence.yml", ".nep2midsence.json",
+			".casemover.yaml", ".casemover.yml", ".casemover.json",
+		}
 		for _, c := range candidates {
 			if _, err := os.Stat(c); err == nil {
 				path = c
