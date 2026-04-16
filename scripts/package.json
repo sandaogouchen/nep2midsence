@@ -1,0 +1,16 @@
+{
+  "name": "nep2midsence-ts-extractor",
+  "version": "1.0.0",
+  "description": "TypeScript AST extractor for nep2midsence",
+  "main": "dist/ts-ast-extractor.js",
+  "scripts": {
+    "build": "tsc",
+    "extract": "node dist/ts-ast-extractor.js"
+  },
+  "dependencies": {
+    "typescript": "^5.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0"
+  }
+}
