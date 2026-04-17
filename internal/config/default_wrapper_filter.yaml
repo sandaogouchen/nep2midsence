@@ -1,0 +1,58 @@
+wrapper_filter:
+  known_infra_roots:
+    - page
+    - browser
+    - context
+    - console
+    - json
+    - math
+    - promise
+    - process
+
+  known_business_name_patterns:
+    - '(?i).*Page$'
+    - '(?i).*Actions$'
+    - '(?i).*Module$'
+    - '(?i).*Helper$'
+
+  # 完整调用链正则黑名单（优先级最高）
+  force_infra_call_patterns: []
+
+  # 完整调用链正则白名单
+  force_business_call_patterns: []
+
+  # 无对象的“方法名黑名单”，如 waitForPageLoadStable()
+  force_infra_methods:
+    - waitForPageLoadStable
+    - verifyIframe
+    - before
+    - after
+    - beforeEach
+    - commonBeforeForBrandAuction
+    
+
+  # 业务对象字段中，像 element 的属性名模式
+  element_like_property_patterns:
+    - '(?i).*Btn$'
+    - '(?i).*Button$'
+    - '(?i).*Input$'
+    - '(?i).*Select$'
+    - '(?i).*Locator$'
+    - '(?i).*Element$'
+
+  # 底层动作末端方法名（用于 element-like 判断）
+  infra_terminal_methods:
+    - click
+    - dblclick
+    - hover
+    - focus
+    - blur
+    - check
+    - uncheck
+    - fill
+    - type
+    - press
+    - locator
+    - nth
+    - first
+    - last

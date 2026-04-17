@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"time"
 
+	"github.com/sandaogouchen/nep2midsence/internal/config"
 	"github.com/sandaogouchen/nep2midsence/internal/types"
 )
 
@@ -42,18 +43,22 @@ type tsFuncEntry struct {
 }
 
 type tsCallEntry struct {
-	Receiver  string   `json:"receiver,omitempty"`
-	FullReceiver string `json:"fullReceiver,omitempty"`
-	FuncName  string   `json:"funcName"`
-	Args      []string `json:"args,omitempty"`
-	Line      int      `json:"line"`
-	IsNepAPI  bool     `json:"isNepAPI"`
-	IsNep     bool     `json:"isNep"`
-	IsAwait   bool     `json:"isAwait"`
-	IsChained bool     `json:"isChained"`
-	IsWrapperCall bool `json:"isWrapperCall,omitempty"`
-	Callee    string   `json:"callee,omitempty"`
-	InFunc    string   `json:"inFunc,omitempty"`
+	Receiver      string   `json:"receiver,omitempty"`
+	FullReceiver  string   `json:"fullReceiver,omitempty"`
+	FuncName      string   `json:"funcName"`
+	OwnerRoot     string   `json:"ownerRoot,omitempty"`
+	OwnerKind     string   `json:"ownerKind,omitempty"`
+	OwnerSource   string   `json:"ownerSource,omitempty"`
+	OwnerFile     string   `json:"ownerFile,omitempty"`
+	Args          []string `json:"args,omitempty"`
+	Line          int      `json:"line"`
+	IsNepAPI      bool     `json:"isNepAPI"`
+	IsNep         bool     `json:"isNep"`
+	IsAwait       bool     `json:"isAwait"`
+	IsChained     bool     `json:"isChained"`
+	IsWrapperCall bool     `json:"isWrapperCall,omitempty"`
+	Callee        string   `json:"callee,omitempty"`
+	InFunc        string   `json:"inFunc,omitempty"`
 }
 
 type tsConstEntry struct {
@@ -200,22 +205,40 @@ func (b *TSBridge) ConvertToASTInfo(r TSExtractResult) *types.ASTInfo {
 
 // ConvertAllCalls converts all call entries from a TSExtractResult into
 // the unified CallStep slice used by L2 chain building.
-func (b *TSBridge) ConvertAllCalls(r TSExtractResult) []types.CallStep {
+func (b *TSBridge) ConvertAllCalls(r TSExtractResult, astInfo *types.ASTInfo, cfg *config.Config) []types.CallStep {
 	steps := make([]types.CallStep, 0, len(r.Calls))
+	ownerCtx := buildTSOwnerContext(r.FilePath, astInfo, cfg)
 	for _, c := range r.Calls {
+		ownerRoot, ownerKind, ownerSource, ownerFile := ownerCtx.classify(c.Callee, c.FullReceiver, c.FuncName)
+		if ownerRoot == "" {
+			ownerRoot = c.OwnerRoot
+		}
+		if ownerKind == "unknown" && c.OwnerKind != "" {
+			ownerKind = c.OwnerKind
+		}
+		if ownerSource == "fallback_unknown" && c.OwnerSource != "" {
+			ownerSource = c.OwnerSource
+		}
+		if ownerFile == "" {
+			ownerFile = c.OwnerFile
+		}
 		steps = append(steps, types.CallStep{
-			Receiver:  c.Receiver,
-			FullReceiver: c.FullReceiver,
-			FuncName:  c.FuncName,
-			Args:      c.Args,
-			Line:      c.Line,
-			IsNep:     c.IsNep,
-			IsNepAPI:  c.IsNepAPI,
-			IsAwait:   c.IsAwait,
-			IsChained: c.IsChained,
-			IsWrapperCall: c.IsWrapperCall,
-			Callee:    c.Callee,
-			InFunc:    c.InFunc,
+			Receiver:      c.Receiver,
+			FullReceiver:  c.FullReceiver,
+			FuncName:      c.FuncName,
+			OwnerRoot:     ownerRoot,
+			OwnerKind:     ownerKind,
+			OwnerSource:   ownerSource,
+			OwnerFile:     ownerFile,
+			Args:          c.Args,
+			Line:          c.Line,
+			IsNep:         c.IsNep,
+			IsNepAPI:      c.IsNepAPI,
+			IsAwait:       c.IsAwait,
+			IsChained:     c.IsChained,
+			IsWrapperCall: ownerKind == "business",
+			Callee:        c.Callee,
+			InFunc:        c.InFunc,
 		})
 	}
 	return steps
