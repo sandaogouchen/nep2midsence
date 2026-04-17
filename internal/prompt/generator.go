@@ -196,7 +196,7 @@ func (g *Generator) buildPromptData(analysis *types.FullAnalysis) *PromptData {
 			if step.MigrationRule != nil {
 				midsceneCall = step.MigrationRule.MidsceneEquivalent
 			} else if stepType == "封装方法" {
-				midsceneCall = "（需先迁移封装定义，再转换为 midscene ai 操作）"
+				midsceneCall = "（需新建 Midscene 版本的重写函数，不要修改原函数；case 中改为调用新函数）"
 			}
 
 			intent := strings.TrimSpace(intentByStepIndex[localIdx])
@@ -279,8 +279,14 @@ func (g *Generator) buildPromptData(analysis *types.FullAnalysis) *PromptData {
 		"迁移前先 Read 参考文档: ",
 		"只修改 NEP 相关代码：把 nep 的调用迁移为 midscene.agent 的等价写法；不要重排无关逻辑",
 		"Pagepass 原生 selector 方式的代码保持不变（例如使用 selector/locator 的直接操作、原生断言/等待等）",
-		"若遇到封装函数（如 commonActions / pageObject 方法）：先确认其定义文件是否已迁移；未迁移则先迁移封装文件，再迁移当前 case；同一封装文件在本次执行中只处理一次",
-		"判断封装文件是否已迁移：若文件中已出现 midscene.agent 的调用（如 agent.aiTap/aiInput/aiAssert/aiAct 等）且不再包含明显 nep 调用（如 ai.action/ai.getElement 等），则视为已迁移，避免重复修改",
+		`若遇到封装函数（如 commonActions / pageObject 方法），采用"新建重写函数"策略，禁止直接修改或替换原有封装函数：
+   a. 在封装文件中新建一个带 Midscene 后缀（或其他可区分命名）的新函数，例如原函数为 editCampaign2() 则新建 editCampaign2Midscene()
+   b. 新函数内部使用 midscene agent API 重写原函数的完整逻辑流程，保持业务语义一致
+   c. 原有封装函数保持不变，不做任何修改
+   d. 在迁移后的 case 文件中，将对原封装函数的调用替换为对新函数的调用（如 listPage.commonActions.editCampaign2() → listPage.commonActions.editCampaign2Midscene()）
+   e. 新函数需要接收 agent 参数（从 case 传入），签名示例：async editCampaign2Midscene(agent: AgentWI)
+   f. 同一封装文件中，对同一个原函数只新建一次重写函数，避免重复`,
+		"判断封装函数是否已有 Midscene 版本：若封装文件中已存在对应的 Midscene 后缀函数（如 editCampaign2Midscene），则直接在 case 中调用该函数，无需再次新建",
 		"不要修改原始文件",
 		"迁移完成后检查代码是否有语法错误",
 	}

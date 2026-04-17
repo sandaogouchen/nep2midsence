@@ -188,7 +188,43 @@ NEP `【】`/`[]` → Midscene `''`（单引号），语义保持一致即可。
 | `flushCache({cleanUnused?})` | 刷新缓存（未配置会 throw） |
 | `destroy()` | 销毁 agent |
 
-## 五、迁移 Checklist
+## 五、封装函数迁移策略（新建重写，不替换原函数）
+
+当 case 中调用了封装函数（如 `listPage.commonActions.editCampaign2()`、pageObject 方法等），**不要直接修改原有封装函数**，而是采用"新建重写函数"策略：
+
+### 步骤
+
+1. **新建函数**：在封装文件中新增一个带 `Midscene` 后缀的新函数
+   ```typescript
+   // 原函数保持不变
+   async editCampaign2(page: Page, ai: AI, campaignName: string) {
+     // ... 原有 NEP 实现 ...
+   }
+
+   // 新建 Midscene 版本
+   async editCampaign2Midscene(agent: AgentWI, campaignName: string) {
+     await agent.aiTap(`列表中名为'${campaignName}'的campaign的编辑按钮`);
+     // ... 用 midscene agent API 重写完整逻辑 ...
+   }
+   ```
+
+2. **保持原函数不变**：原有的 `editCampaign2()` 函数完全不动，其他未迁移的 case 仍然可以正常使用
+
+3. **case 中切换调用**：迁移后的 case 文件中，将调用改为新函数
+   ```typescript
+   // 迁移前
+   await listPage.commonActions.editCampaign2(page, ai, campaignName);
+   // 迁移后
+   await listPage.commonActions.editCampaign2Midscene(agent, campaignName);
+   ```
+
+4. **传入 agent**：新函数需要接收 `agent` 参数（由 case 传入），而非原来的 `page`/`ai` 参数
+
+5. **避免重复**：若封装文件中已存在 `xxxMidscene` 版本函数，case 直接调用即可，无需再次新建
+
+---
+
+## 六、迁移 Checklist
 
 1. **模板**：用上面「第零节」的标准 describe/it + 三行导入解构，取到 `agent`
 2. **逐行翻译**：selector→AI prompt / `ai?.action`→拆 aiTap/aiInput / `ai?.getElement`+操作→合并 / 双路径→只留 AI
