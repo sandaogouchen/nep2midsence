@@ -1,0 +1,82 @@
+{
+  "current_run": {
+    "id": "run-1776401523746017000",
+    "dir": "/Users/bytedance/Documents/nep2midsence",
+    "status": "running",
+    "started_at": "2026-04-17T12:52:03.74602+08:00",
+    "updated_at": "2026-04-17T12:52:06.103219+08:00",
+    "ended_at": "0001-01-01T00:00:00Z",
+    "total_files": 7,
+    "completed": 0,
+    "failed": 4,
+    "pending": 3,
+    "current_file": "/Users/bytedance/Documents/nep2midsence/internal/executor/coco_test.go",
+    "tasks": [
+      {
+        "file": "/Users/bytedance/Documents/nep2midsence/internal/cli/execute_test.go",
+        "status": "failed",
+        "error": "migration failed",
+        "updated_at": "2026-04-17T12:52:06.084439+08:00"
+      },
+      {
+        "file": "/Users/bytedance/Documents/nep2midsence/testdata/sample_nep_case/login_test.go",
+        "status": "failed",
+        "error": "migration failed",
+        "updated_at": "2026-04-17T12:52:06.084442+08:00"
+      },
+      {
+        "file": "/Users/bytedance/Documents/nep2midsence/internal/prompt/generator_test.go",
+        "status": "failed",
+        "error": "migration failed",
+        "updated_at": "2026-04-17T12:52:06.084492+08:00"
+      },
+      {
+        "file": "/Users/bytedance/Documents/nep2midsence/internal/executor/coco_test.go",
+        "status": "failed",
+        "error": "migration failed",
+        "updated_at": "2026-04-17T12:52:06.103219+08:00"
+      }
+    ]
+  },
+  "runs": [
+    {
+      "id": "run-1776401523746017000",
+      "dir": "/Users/bytedance/Documents/nep2midsence",
+      "status": "running",
+      "started_at": "2026-04-17T12:52:03.74602+08:00",
+      "updated_at": "2026-04-17T12:52:06.103219+08:00",
+      "ended_at": "0001-01-01T00:00:00Z",
+      "total_files": 7,
+      "completed": 0,
+      "failed": 4,
+      "pending": 3,
+      "current_file": "/Users/bytedance/Documents/nep2midsence/internal/executor/coco_test.go",
+      "tasks": [
+        {
+          "file": "/Users/bytedance/Documents/nep2midsence/internal/cli/execute_test.go",
+          "status": "failed",
+          "error": "migration failed",
+          "updated_at": "2026-04-17T12:52:06.084439+08:00"
+        },
+        {
+          "file": "/Users/bytedance/Documents/nep2midsence/testdata/sample_nep_case/login_test.go",
+          "status": "failed",
+          "error": "migration failed",
+          "updated_at": "2026-04-17T12:52:06.084442+08:00"
+        },
+        {
+          "file": "/Users/bytedance/Documents/nep2midsence/internal/prompt/generator_test.go",
+          "status": "failed",
+          "error": "migration failed",
+          "updated_at": "2026-04-17T12:52:06.084492+08:00"
+        },
+        {
+          "file": "/Users/bytedance/Documents/nep2midsence/internal/executor/coco_test.go",
+          "status": "failed",
+          "error": "migration failed",
+          "updated_at": "2026-04-17T12:52:06.103219+08:00"
+        }
+      ]
+    }
+  ]
+}

@@ -24,6 +24,13 @@ const TEST_BLOCKS = new Set(["describe", "it", "test"]);
 // ── Types ──────────────────────────────────────────────────────────────────────
 interface ImportInfo {
   module: string;
+  // For Go-side TSBridge compatibility
+  names?: string;
+  alias?: string;
+  line?: number;
+  isNep?: boolean;
+
+  // Extra info (optional, kept for debugging)
   specifiers: string[];
   isDefault: boolean;
   isNamespace: boolean;
@@ -44,19 +51,50 @@ interface FunctionInfo {
   isTest: boolean;
   isHelper: boolean;
   testType: string;
-  params: Array<{ name: string; type: string }>;
+  // For Go-side TSBridge compatibility
+  params: string[];
   startLine: number;
   endLine: number;
   bodyText: string;
+  doc?: string;
+  receiver?: string;
 }
 
 interface CallInfo {
   callee: string;
+  // For Go-side TSBridge compatibility
+  args?: string[];
+
+  // Extra info (optional)
   arguments: string[];
   startLine: number;
   isAwait: boolean;
   isNepAPI: boolean;
   nepAPIType: string;
+
+  // For Go-side TSBridge compatibility
+  receiver?: string;
+  fullReceiver?: string;
+  funcName?: string;
+  line?: number;
+  isNep?: boolean;
+  isChained?: boolean;
+  inFunc?: string;
+  isWrapperCall?: boolean;
+}
+
+interface ConstInfo {
+  name: string;
+  value: string;
+  type?: string;
+  line: number;
+}
+
+interface VarInfo {
+  name: string;
+  value: string;
+  type?: string;
+  line: number;
 }
 
 interface HookBlock {
@@ -87,17 +125,23 @@ interface DescribeBlock {
 
 interface FileAnalysis {
   filePath: string;
-  fileName: string;
-  language: "typescript" | "javascript";
+  // Go-side TSBridge expects these keys:
   imports: ImportInfo[];
-  topLevelVariables: TopLevelVariable[];
   functions: FunctionInfo[];
-  allCalls: CallInfo[];
-  testStructure: { describes: DescribeBlock[] };
-  rawLineCount: number;
-  parseErrors: string[];
-  warnings: string[];
-  extractedAt: string;
+  calls: CallInfo[];
+  constants: ConstInfo[];
+  variables: VarInfo[];
+
+  // Extra fields (not required by TSBridge, kept for debugging/future)
+  fileName?: string;
+  language?: "typescript" | "javascript";
+  topLevelVariables?: TopLevelVariable[];
+  allCalls?: CallInfo[];
+  testStructure?: { describes: DescribeBlock[] };
+  rawLineCount?: number;
+  parseErrors?: string[];
+  warnings?: string[];
+  extractedAt?: string;
 }
 
 // ── Utility Helpers ────────────────────────────────────────────────────────────
@@ -185,13 +229,33 @@ function collectCalls(node: ts.Node, src: ts.SourceFile, sourceText: string): Ca
     if (ts.isCallExpression(target)) {
       const callee = calleeText(target as ts.CallExpression, src);
       const nep = resolveNep(callee);
+
+      const parts = callee.split(".");
+      const funcName = terminalMethodName(callee);
+      const fullReceiver = parts.length > 1 ? parts.slice(0, -1).join(".") : "";
+      const receiver = parts.length > 1 ? parts[parts.length - 2] : "";
+      const isChained = parts.length > 1;
+      const isWrapperCall = parts.length > 2;
+
+      const startLine = lineOf(src, target.getStart());
       calls.push({
         callee,
+        args: argTexts(target as ts.CallExpression, src),
         arguments: argTexts(target as ts.CallExpression, src),
-        startLine: lineOf(src, target.getStart()),
+        startLine,
         isAwait: awaited,
         isNepAPI: nep.isNepAPI,
         nepAPIType: nep.nepAPIType,
+
+        // TSBridge-compatible fields
+        receiver,
+        fullReceiver,
+        funcName,
+        line: startLine,
+        isNep: nep.isNepAPI,
+        isChained,
+        inFunc: "",
+        isWrapperCall,
       });
     }
     ts.forEachChild(n, walk);
@@ -258,9 +322,10 @@ function extractImport(node: ts.ImportDeclaration, src: ts.SourceFile): ImportIn
   const specifiers: string[] = [];
   let isDef = false;
   let isNs = false;
+  let alias = "";
 
   if (clause) {
-    if (clause.name) { isDef = true; specifiers.push(clause.name.text); }
+    if (clause.name) { isDef = true; specifiers.push(clause.name.text); alias = clause.name.text; }
     const bindings = clause.namedBindings;
     if (bindings) {
       if (ts.isNamespaceImport(bindings)) {
@@ -271,17 +336,40 @@ function extractImport(node: ts.ImportDeclaration, src: ts.SourceFile): ImportIn
       }
     }
   }
-  return { module, specifiers, isDefault: isDef, isNamespace: isNs };
+
+  const line = lineOf(src, node.getStart());
+  const names = specifiers.join(",");
+  const isNep = module.toLowerCase().includes("nep");
+  return { module, names, alias, line, isNep, specifiers, isDefault: isDef, isNamespace: isNs };
 }
 
 // ── Params Extractor ───────────────────────────────────────────────────────────
 function extractParams(
   params: ts.NodeArray<ts.ParameterDeclaration>, src: ts.SourceFile
-): Array<{ name: string; type: string }> {
-  return params.map((p) => ({
-    name: p.name.getText(src),
-    type: p.type ? p.type.getText(src) : "",
-  }));
+): string[] {
+  return params.map((p) => p.name.getText(src));
+}
+
+function flattenDescribeTests(describes: DescribeBlock[], out: FunctionInfo[]) {
+  for (const d of describes) {
+    for (const t of d.tests) {
+      out.push({
+        name: t.name,
+        isAsync: t.isAsync,
+        isExported: false,
+        isTest: true,
+        isHelper: false,
+        testType: "it",
+        params: [],
+        startLine: t.startLine,
+        endLine: t.endLine,
+        bodyText: "",
+        doc: "",
+        receiver: "",
+      });
+    }
+    flattenDescribeTests(d.nestedDescribes, out);
+  }
 }
 
 // ── Main File Analyser ─────────────────────────────────────────────────────────
@@ -320,6 +408,8 @@ function analyseFile(filePath: string): FileAnalysis {
   const functions: FunctionInfo[] = [];
   const allCalls: CallInfo[] = [];
   const describes: DescribeBlock[] = [];
+  const constants: ConstInfo[] = [];
+  const variables: VarInfo[] = [];
 
   // Global call collection
   allCalls.push(...collectCalls(src, src, sourceText));
@@ -336,13 +426,32 @@ function analyseFile(filePath: string): FileAnalysis {
     if (ts.isVariableStatement(stmt)) {
       const kind = varKind(stmt.declarationList.flags);
       for (const decl of stmt.declarationList.declarations) {
+        const initializer = decl.initializer ? decl.initializer.getText(src) : "";
+        const startLine = lineOf(src, stmt.getStart());
         topLevelVariables.push({
           name: decl.name.getText(src),
           kind,
           type: typeText(decl.type, src),
-          initializer: decl.initializer ? decl.initializer.getText(src) : "",
-          startLine: lineOf(src, stmt.getStart()),
+          initializer,
+          startLine,
         });
+
+        // TSBridge-compatible constants/variables
+        if (kind === "const") {
+          constants.push({
+            name: decl.name.getText(src),
+            value: initializer,
+            type: typeText(decl.type, src),
+            line: startLine,
+          });
+        } else {
+          variables.push({
+            name: decl.name.getText(src),
+            value: initializer,
+            type: typeText(decl.type, src),
+            line: startLine,
+          });
+        }
       }
     }
 
@@ -359,6 +468,8 @@ function analyseFile(filePath: string): FileAnalysis {
         startLine: lineOf(src, stmt.getStart()),
         endLine: lineOf(src, stmt.getEnd()),
         bodyText: stmt.body ? bodyTextOf(stmt.body, sourceText) : "",
+        doc: "",
+        receiver: "",
       });
     }
 
@@ -381,6 +492,8 @@ function analyseFile(filePath: string): FileAnalysis {
             startLine: lineOf(src, stmt.getStart()),
             endLine: lineOf(src, stmt.getEnd()),
             bodyText: fn.body ? bodyTextOf(fn.body, sourceText) : "",
+            doc: "",
+            receiver: "",
           });
         }
       }
@@ -407,18 +520,32 @@ function analyseFile(filePath: string): FileAnalysis {
           startLine: lineOf(src, stmt.getStart()),
           endLine: lineOf(src, stmt.getEnd()),
           bodyText: cbBody ? bodyTextOf(cbBody, sourceText) : "",
+          doc: "",
+          receiver: "",
         });
       }
     }
   }
 
+  // Add tests nested inside describe blocks into the functions list so Go-side
+  // call-chain grouping can work.
+  flattenDescribeTests(describes, functions);
+
+  // TSBridge-compatible call list
+  const calls = allCalls;
+
   return {
     filePath: absolutePath,
+    imports,
+    functions,
+    calls,
+    constants,
+    variables,
+
+    // extra/debug
     fileName: path.basename(filePath),
     language,
-    imports,
     topLevelVariables,
-    functions,
     allCalls,
     testStructure: { describes },
     rawLineCount,

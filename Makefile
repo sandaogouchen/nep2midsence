@@ -17,7 +17,8 @@ build:
 	@echo ""
 	@echo "✅ 构建成功: ./$(BINARY_NAME)"
 	@echo "💡 运行方式:"
-	@echo "   ./$(BINARY_NAME) --help"
+	@echo "   ./$(BINARY_NAME)"
+	@echo "   ./$(BINARY_NAME) --config /path/to/.nep2midsence.yaml"
 	@echo "   或执行 'make install' 安装到 PATH"
 
 clean:

@@ -50,6 +50,7 @@ func (a *CallGraphAnalyzer) BuildChainsFromTSCalls(astInfo *types.ASTInfo, allCa
 
 	for _, fn := range testFuncs {
 		chain := &types.CallChain{
+			EntryFunc: fn.Name,
 			TestFunc:  fn.Name,
 			StartLine: fn.LineStart,
 			EndLine:   fn.LineEnd,
@@ -60,6 +61,9 @@ func (a *CallGraphAnalyzer) BuildChainsFromTSCalls(astInfo *types.ASTInfo, allCa
 				chain.Steps = append(chain.Steps, call)
 				if call.IsNepAPI {
 					chain.NepAPICalls = append(chain.NepAPICalls, call)
+				}
+				if call.IsWrapperCall {
+					chain.WrapperCalls = append(chain.WrapperCalls, call)
 				}
 				claimed[idx] = true
 			}
@@ -73,20 +77,26 @@ func (a *CallGraphAnalyzer) BuildChainsFromTSCalls(astInfo *types.ASTInfo, allCa
 	// Collect orphan calls (outside any test function) into a single chain.
 	var orphanSteps []types.CallStep
 	var orphanNep []types.CallStep
+	var orphanWrapper []types.CallStep
 	for idx, call := range sorted {
 		if !claimed[idx] {
 			orphanSteps = append(orphanSteps, call)
 			if call.IsNepAPI {
 				orphanNep = append(orphanNep, call)
 			}
+			if call.IsWrapperCall {
+				orphanWrapper = append(orphanWrapper, call)
+			}
 		}
 	}
 
 	if len(orphanSteps) > 0 {
 		orphanChain := &types.CallChain{
+			EntryFunc:   "<top-level>",
 			TestFunc:    "<top-level>",
 			Steps:       orphanSteps,
 			NepAPICalls: orphanNep,
+			WrapperCalls: orphanWrapper,
 		}
 		if len(orphanSteps) > 0 {
 			orphanChain.StartLine = orphanSteps[0].Line
