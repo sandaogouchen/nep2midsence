@@ -641,3 +641,47 @@ func containsPromptName(items []string, value string) bool {
 func (g *Generator) GenerateRetryPrompt(original string, lastError string, attempt int) string {
 	return fmt.Sprintf("%s\n\n---\n\n## ⚠️ 重试说明（第 %d 次重试）\n\n上一次执行失败，错误信息：\n\n```\n%s\n```\n\n请根据错误信息修正代码，确保：\n1. 代码语法正确\n2. 所有 import 都被正确使用\n3. 类型匹配正确\n4. 不要遗漏任何必要的迁移步骤\n", original, attempt, lastError)
 }
+
+// GenerateNepFixPrompt creates a targeted prompt for fixing NEP residual markers
+// in an already-migrated file. It instructs the AI to read the target file, locate
+// the specific NEP markers, and replace them with Midscene equivalents.
+func (g *Generator) GenerateNepFixPrompt(targetFile string, nepMarkers string, attempt int) string {
+	return fmt.Sprintf(`## NEP 残留修正任务（第 %d 次修正）
+
+**严格按照以下指令执行，不要做额外的事情。**
+
+---
+
+### 问题描述
+
+文件 `+"`%s`"+` 迁移后仍残留以下 NEP 框架标记：
+
+`+"```\n%s\n```"+`
+
+这些标记必须被完全移除或替换为 Midscene 等价写法。
+
+---
+
+### 操作步骤
+
+1. **Read** 目标文件 `+"`%s`"+`
+2. **定位** 上述残留标记在代码中的位置
+3. **替换规则**：
+   - `+"`ai.action(`"+` / `+"`ai?.action(`"+` → `+"`agent.aiAction(`"+` 或 `+"`agent.aiAct(`"+`
+   - `+"`ai.getElement(`"+` / `+"`ai?.getElement(`"+` → `+"`agent.aiLocate(`"+` 或直接使用 `+"`agent.aiTap/aiInput`"+`
+   - `+"`clickElementByVL(`"+` → `+"`agent.aiTap(`"+`
+   - `+"`from 'nep`"+` / `+"`from \"nep\"`"+` → 移除或替换为 midscene import
+   - `+"`require('nep`"+` / `+"`require(\"nep\")`"+` → 移除或替换为 midscene require
+   - `+"`nep_utils`"+` → 移除或替换为 midscene 工具引用
+   - `+"`AiAgent`"+` → 移除或替换为 midscene Agent 初始化
+4. **Write** 修正后的完整文件到原路径 `+"`%s`"+`
+
+---
+
+### 约束
+
+1. 仅修改 NEP 残留部分，不要改动业务逻辑、selector 操作和其他正确代码
+2. 确保修改后文件语法正确，import 完整
+3. 不要新增任何不必要的代码
+`, attempt, targetFile, nepMarkers, targetFile, targetFile)
+}

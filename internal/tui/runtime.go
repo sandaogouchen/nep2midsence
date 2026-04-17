@@ -286,6 +286,52 @@ func (r *AppRuntime) RunStart(ctx context.Context, dir string, targetBaseDir str
 	verifier := verify.NewVerifier(verifyDir, "", "")
 	verifyResults := verifier.VerifyAll(results)
 
+	// NEP residual fix loop: re-execute AI fix for files that still contain NEP markers.
+	maxNepFixRounds := r.cfg.Execution.RetryLimit
+	if maxNepFixRounds <= 0 {
+		maxNepFixRounds = 2
+	}
+	for round := 1; round <= maxNepFixRounds; round++ {
+		var nepFailedIdx []int
+		for i, vr := range verifyResults {
+			if !vr.NepCleanOK && vr.NepCleanError != "" && results[i].Success {
+				nepFailedIdx = append(nepFailedIdx, i)
+			}
+		}
+		if len(nepFailedIdx) == 0 {
+			break
+		}
+
+		notify(WorkflowEvent{
+			Stage:   "nep-fix",
+			Message: fmt.Sprintf("NEP 残留修正（第 %d 轮，%d 个文件）", round, len(nepFailedIdx)),
+			Total:   len(nepFailedIdx),
+		})
+
+		for fixNum, idx := range nepFailedIdx {
+			res := results[idx]
+			vr := verifyResults[idx]
+			fixPrompt := gen.GenerateNepFixPrompt(res.TargetFile, vr.NepCleanError, round)
+
+			notify(WorkflowEvent{
+				Stage:       "nep-fix",
+				Message:     fmt.Sprintf("修正 %s", filepath.Base(res.TargetFile)),
+				Current:     fixNum + 1,
+				Total:       len(nepFailedIdx),
+				CurrentFile: res.TargetFile,
+			})
+
+			output, execErr := promptExec.Execute(ctx, fixPrompt)
+			res.NepFixAttempts = round
+			if execErr == nil && output.Success {
+				// Re-verify NEP cleanliness after fix.
+				cleanOK, cleanErr := verify.CheckNepClean(res.TargetFile)
+				verifyResults[idx].NepCleanOK = cleanOK
+				verifyResults[idx].NepCleanError = cleanErr
+			}
+		}
+	}
+
 	reporter := verify.NewReporter()
 	report := reporter.Generate(results, verifyResults, time.Since(startedAt))
 

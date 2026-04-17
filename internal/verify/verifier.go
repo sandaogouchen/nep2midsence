@@ -36,7 +36,7 @@ func (v *Verifier) Verify(result *types.MigrationResult) *types.VerifyResult {
 	vr := &types.VerifyResult{CaseFile: result.CaseFile}
 
 	// 0. NEP residual check (cross-repo: migrated files must not contain NEP markers)
-	vr.NepCleanOK, vr.NepCleanError = checkNepClean(result.TargetFile)
+	vr.NepCleanOK, vr.NepCleanError = CheckNepClean(result.TargetFile)
 
 	// 1. Compile check
 	vr.CompileOK, vr.CompileError = v.checkCompile(result.TargetFile)
@@ -139,8 +139,9 @@ var nepResidualMarkers = []string{
 	"AiAgent",
 }
 
-// checkNepClean scans a target file for residual NEP markers.
-func checkNepClean(targetFile string) (bool, string) {
+// CheckNepClean scans a target file for residual NEP markers.
+// Returns (true, "") if clean, or (false, details) if residual markers are found.
+func CheckNepClean(targetFile string) (bool, string) {
 	if targetFile == "" {
 		return true, ""
 	}
