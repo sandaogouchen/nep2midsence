@@ -6,6 +6,7 @@ type FullAnalysis struct {
 	TargetPath   string           `json:"target_path"`
 	Package      string           `json:"package"`
 	Complexity   string           `json:"complexity"` // simple / medium / complex
+	Language     string           `json:"language,omitempty"`
 
 	AST          *ASTInfo         `json:"ast"`
 	CallChains   []*CallChain     `json:"call_chains"`
@@ -33,6 +34,10 @@ type ImportInfo struct {
 	Alias  string   `json:"alias"`
 	IsNep  bool     `json:"is_nep"`
 	UsedBy []string `json:"used_by"`
+
+	// TS-specific fields used by ts_bridge.go
+	Name string `json:"name,omitempty"`
+	Line int    `json:"line,omitempty"`
 }
 
 type FuncInfo struct {
@@ -71,12 +76,14 @@ type ConstInfo struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
 	Type  string `json:"type"`
+	Line  int    `json:"line,omitempty"` // TS-specific, used by layer3_dataflow_v2.go
 }
 
 type VarInfo struct {
 	Name  string `json:"name"`
 	Type  string `json:"type"`
 	Value string `json:"value"`
+	Line  int    `json:"line,omitempty"` // TS-specific, used by layer3_dataflow_v2.go
 }
 
 type InitInfo struct {

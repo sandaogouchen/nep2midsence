@@ -25,10 +25,12 @@ type Engine struct {
 func NewEngine(cfg *config.Config) *Engine {
 	customMappings := make(map[string]*types.MigrationRule)
 	for apiName, cm := range cfg.CustomMappings {
+		// cfg.CustomMappings is map[string]string where the value is
+		// the midscene equivalent API name. Wrap it into a MigrationRule.
 		customMappings[apiName] = &types.MigrationRule{
 			NepAPI:             apiName,
-			MidsceneEquivalent: cm.MidsceneEquivalent,
-			NeedsIntentRewrite: cm.NeedsIntentRewrite,
+			MidsceneEquivalent: cm,
+			NeedsIntentRewrite: false,
 		}
 	}
 
