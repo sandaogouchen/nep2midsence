@@ -25,18 +25,19 @@ type TaskSnapshot struct {
 
 // RunSnapshot captures a single migration or analysis run.
 type RunSnapshot struct {
-	ID         string         `json:"id"`
-	Dir        string         `json:"dir"`
-	Status     string         `json:"status"`
-	StartedAt  time.Time      `json:"started_at"`
-	UpdatedAt  time.Time      `json:"updated_at"`
-	EndedAt    time.Time      `json:"ended_at,omitempty"`
-	TotalFiles int            `json:"total_files"`
-	Completed  int            `json:"completed"`
-	Failed     int            `json:"failed"`
-	Pending    int            `json:"pending"`
-	CurrentFile string        `json:"current_file,omitempty"`
-	Tasks      []TaskSnapshot `json:"tasks"`
+	ID            string         `json:"id"`
+	Dir           string         `json:"dir"`
+	TargetBaseDir string         `json:"target_base_dir,omitempty"` // cross-repo target root
+	Status        string         `json:"status"`
+	StartedAt     time.Time      `json:"started_at"`
+	UpdatedAt     time.Time      `json:"updated_at"`
+	EndedAt       time.Time      `json:"ended_at,omitempty"`
+	TotalFiles    int            `json:"total_files"`
+	Completed     int            `json:"completed"`
+	Failed        int            `json:"failed"`
+	Pending       int            `json:"pending"`
+	CurrentFile   string         `json:"current_file,omitempty"`
+	Tasks         []TaskSnapshot `json:"tasks"`
 }
 
 // StateSnapshot is the shared persisted format used by the TUI for status/history views.
@@ -75,19 +76,20 @@ func NewStateStore(dir string) (*StateStore, error) {
 }
 
 // StartRun creates a new run and persists it immediately.
-func (s *StateStore) StartRun(runID, dir string, totalFiles int, startedAt time.Time) error {
+func (s *StateStore) StartRun(runID, dir, targetBaseDir string, totalFiles int, startedAt time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	run := RunSnapshot{
-		ID:         runID,
-		Dir:        dir,
-		Status:     "running",
-		StartedAt:  startedAt,
-		UpdatedAt:  startedAt,
-		TotalFiles: totalFiles,
-		Pending:    totalFiles,
-		Tasks:      make([]TaskSnapshot, 0, totalFiles),
+		ID:            runID,
+		Dir:           dir,
+		TargetBaseDir: targetBaseDir,
+		Status:        "running",
+		StartedAt:     startedAt,
+		UpdatedAt:     startedAt,
+		TotalFiles:    totalFiles,
+		Pending:       totalFiles,
+		Tasks:         make([]TaskSnapshot, 0, totalFiles),
 	}
 
 	s.state.Runs = append(s.state.Runs, run)

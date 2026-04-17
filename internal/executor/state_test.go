@@ -15,7 +15,7 @@ func TestStateStorePersistsRunLifecycle(t *testing.T) {
 
 	runID := "run-1"
 	startedAt := time.Date(2026, 4, 17, 12, 0, 0, 0, time.UTC)
-	if err := store.StartRun(runID, ".", 2, startedAt); err != nil {
+	if err := store.StartRun(runID, ".", "", 2, startedAt); err != nil {
 		t.Fatalf("StartRun returned error: %v", err)
 	}
 	if err := store.RecordTaskResult(runID, "a_test.go", "completed", "", "case", "", "", startedAt.Add(2*time.Second)); err != nil {

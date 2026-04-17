@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"unicode"
 
@@ -28,15 +29,16 @@ type Options struct {
 type viewState string
 
 const (
-	viewHome      viewState = "home"
-	viewHelp      viewState = "help"
-	viewDirectory viewState = "directory"
-	viewRunning   viewState = "running"
-	viewResults   viewState = "results"
-	viewStatus    viewState = "status"
-	viewHistory   viewState = "history"
-	viewConfig    viewState = "config"
-	viewVersion   viewState = "version"
+	viewHome            viewState = "home"
+	viewHelp            viewState = "help"
+	viewDirectory       viewState = "directory"
+	viewTargetDirectory viewState = "target_directory"
+	viewRunning         viewState = "running"
+	viewResults         viewState = "results"
+	viewStatus          viewState = "status"
+	viewHistory         viewState = "history"
+	viewConfig          viewState = "config"
+	viewVersion         viewState = "version"
 )
 
 type workflowMode string
@@ -87,6 +89,8 @@ type Model struct {
 	lastResult           *WorkflowResult
 	statusSnapshot       executor.StateSnapshot
 	logScroll            int
+	targetBaseDir    string // cross-repo target directory
+	targetBrowsePath string // current path in target directory browser
 }
 
 func NewModel(cfg *config.Config, runtime Runtime, opts Options) Model {
@@ -158,8 +162,45 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			case "enter":
 				if item, ok := m.directoryList.SelectedItem().(directoryItem); ok {
-					return m.beginWorkflow(string(item))
+					selected := string(item)
+					if m.pickerMode == modeStart {
+						// Phase 1 complete: source dir selected, transition to target dir picker.
+						m.currentDir = selected
+						return m.openTargetDirectoryPicker()
+					}
+					return m.beginWorkflow(selected)
 				}
+			case "up", "down", "left", "right", "pgup", "pgdown", "home", "end":
+				var cmd tea.Cmd
+				m.directoryList, cmd = m.directoryList.Update(msg)
+				return m, cmd
+			}
+			var cmd tea.Cmd
+			m.directorySearchInput, cmd = m.directorySearchInput.Update(msg)
+			m.applyDirectoryFilter(m.directorySearchInput.Value())
+			return m, cmd
+		}
+		if m.activeView == viewTargetDirectory {
+			switch msg.String() {
+			case "esc":
+				// Go up one level; if at root, return to source picker.
+				parent := filepath.Dir(m.targetBrowsePath)
+				if parent == m.targetBrowsePath {
+					// Already at filesystem root, go back to source directory picker.
+					return m.openDirectoryPicker(modeStart)
+				}
+				m.targetBrowsePath = parent
+				return m.refreshTargetDirectoryList()
+			case "enter":
+				if item, ok := m.directoryList.SelectedItem().(directoryItem); ok {
+					// Navigate into the selected subdirectory.
+					m.targetBrowsePath = string(item)
+					return m.refreshTargetDirectoryList()
+				}
+			case "tab":
+				// Confirm current browse path as target directory.
+				m.targetBaseDir = m.targetBrowsePath
+				return m.beginWorkflow(m.currentDir)
 			case "up", "down", "left", "right", "pgup", "pgdown", "home", "end":
 				var cmd tea.Cmd
 				m.directoryList, cmd = m.directoryList.Update(msg)
@@ -381,7 +422,37 @@ func (m Model) openDirectoryPicker(mode workflowMode) (tea.Model, tea.Cmd) {
 	m.applyDirectoryFilter("")
 	m.pickerMode = mode
 	m.activeView = viewDirectory
+	m.targetBaseDir = ""
 	m.lastInfo = "输入关键字搜索目录，方向键选择，回车确认，Esc 返回"
+	return m, cmd
+}
+
+// openTargetDirectoryPicker transitions to the cross-repo target directory browser.
+// It starts from the previously saved target.base_dir (if any) or the filesystem root.
+func (m Model) openTargetDirectoryPicker() (tea.Model, tea.Cmd) {
+	startPath := strings.TrimSpace(m.cfg.Target.BaseDir)
+	if startPath == "" {
+		startPath = "/"
+	}
+	m.targetBrowsePath = startPath
+	m.activeView = viewTargetDirectory
+	m.lastInfo = "浏览并选择目标仓库目录：Enter 进入子目录，Tab 确认当前目录，Esc 返回上级"
+	return m.refreshTargetDirectoryList()
+}
+
+// refreshTargetDirectoryList reloads the immediate subdirectories for the current
+// browse path in the target directory picker.
+func (m Model) refreshTargetDirectoryList() (tea.Model, tea.Cmd) {
+	dirs, err := m.runtime.ListImmediateDirectories(m.targetBrowsePath)
+	if err != nil {
+		m.lastError = fmt.Sprintf("读取目录失败: %s", err)
+		return m, nil
+	}
+	m.allDirectories = dirs
+	m.directorySearchInput.SetValue("")
+	cmd := m.directorySearchInput.Focus()
+	m.applyDirectoryFilter("")
+	m.directoryList.Title = fmt.Sprintf("目标目录: %s", m.targetBrowsePath)
 	return m, cmd
 }
 
@@ -396,12 +467,16 @@ func (m Model) beginWorkflow(dir string) (tea.Model, tea.Cmd) {
 	m.currentFile = ""
 	m.lastResult = nil
 	m.appendLog(fmt.Sprintf("已选择目录: %s", dir))
+	if m.targetBaseDir != "" {
+		m.appendLog(fmt.Sprintf("跨仓库目标: %s", m.targetBaseDir))
+	}
 
 	ch := make(chan tea.Msg, 32)
 	m.runtimeMsgs = ch
 
 	mode := m.pickerMode
 	runtime := m.runtime
+	targetBaseDir := m.targetBaseDir
 	go func() {
 		notify := func(event WorkflowEvent) {
 			ch <- runtimeEventMsg{event: event}
@@ -412,7 +487,7 @@ func (m Model) beginWorkflow(dir string) (tea.Model, tea.Cmd) {
 		if mode == modeAnalyze {
 			result, err = runtime.RunAnalyze(ctx, dir, notify)
 		} else {
-			result, err = runtime.RunStart(ctx, dir, notify)
+			result, err = runtime.RunStart(ctx, dir, targetBaseDir, notify)
 		}
 		ch <- runtimeFinishedMsg{result: result, err: err}
 		close(ch)
@@ -550,6 +625,10 @@ func (m Model) renderMain() string {
 		}, "\n")
 	case viewDirectory:
 		return fmt.Sprintf("%s\n\n%s", m.directorySearchInput.View(), m.directoryList.View())
+	case viewTargetDirectory:
+		breadcrumb := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39")).Render(m.targetBrowsePath)
+		hint := lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("Enter: 进入目录 | Tab: 确认选择 | Esc: 返回上级")
+		return fmt.Sprintf("选择目标仓库根目录\n当前: %s\n%s\n\n%s\n\n%s", breadcrumb, hint, m.directorySearchInput.View(), m.directoryList.View())
 	case viewRunning:
 		return m.renderRunningView()
 	case viewResults:

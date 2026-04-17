@@ -40,6 +40,9 @@ type PromptData struct {
 	Constraints    []string
 	ExampleBefore  string
 	ExampleAfter   string
+	IsCrossRepo    bool
+	SourceRepoRoot string
+	TargetRepoRoot string
 }
 
 type MappingEntry struct {
@@ -293,6 +296,20 @@ func (g *Generator) buildPromptData(analysis *types.FullAnalysis) *PromptData {
 		"判断封装函数是否已有 Midscene 版本：若封装文件中已存在对应的 Midscene 后缀函数（如 editCampaign2Midscene），则直接在 case 中调用该函数，无需再次新建",
 		"不要修改原始文件",
 		"迁移完成后检查代码是否有语法错误",
+	}
+
+	// Cross-repo mode: inject additional constraints
+	if g.cfg.IsCrossRepo() {
+		data.IsCrossRepo = true
+		data.SourceRepoRoot = g.cfg.Source.Dir
+		data.TargetRepoRoot = g.cfg.Target.BaseDir
+
+		data.Constraints = append(data.Constraints,
+			fmt.Sprintf("跨仓库迁移模式：源文件位于 %s，迁移输出写入目标仓库 %s", g.cfg.Source.Dir, g.cfg.Target.BaseDir),
+			"从源仓库 Read 源文件，将迁移结果写入目标仓库对应路径；目标目录不存在时自动创建",
+			"输出文件中不得残留任何 NEP 相关 import 或调用（ai.action、ai?.action、from 'nep'、AiAgent 等）",
+			"仅修改 NEP/ai/AiAgent 相关代码，Pagepass 业务逻辑、selector 操作、工具函数等保持不变",
+		)
 	}
 
 	return data

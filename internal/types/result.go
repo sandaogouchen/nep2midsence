@@ -13,12 +13,14 @@ type MigrationResult struct {
 }
 
 type VerifyResult struct {
-	CaseFile     string `json:"case_file"`
-	CompileOK    bool   `json:"compile_ok"`
-	CompileError string `json:"compile_error,omitempty"`
-	TestOK       bool   `json:"test_ok"`
-	TestError    string `json:"test_error,omitempty"`
-	Diff         string `json:"diff,omitempty"`
+	CaseFile      string `json:"case_file"`
+	CompileOK     bool   `json:"compile_ok"`
+	CompileError  string `json:"compile_error,omitempty"`
+	TestOK        bool   `json:"test_ok"`
+	TestError     string `json:"test_error,omitempty"`
+	Diff          string `json:"diff,omitempty"`
+	NepCleanOK    bool   `json:"nep_clean_ok"`              // true if no NEP residual markers found
+	NepCleanError string `json:"nep_clean_error,omitempty"` // details of remaining NEP markers
 }
 
 type MigrationReport struct {
