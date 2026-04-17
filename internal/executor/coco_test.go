@@ -15,6 +15,8 @@ func TestCocoExecutorExecuteUsesCocoBinary(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script test is unix-only")
 	}
+	// Keep tests deterministic: do not depend on tmux availability.
+	t.Setenv("NEP2MIDSENCE_COCO_TMUX", "0")
 
 	tmpDir := t.TempDir()
 	writeExecutable(t, filepath.Join(tmpDir, "coco"), "#!/bin/sh\nprintf 'ok\\n'\n")
@@ -48,6 +50,8 @@ func TestCocoExecutorExecuteBuildsSupportedCLIArgs(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script test is unix-only")
 	}
+	// Keep tests deterministic: do not depend on tmux availability.
+	t.Setenv("NEP2MIDSENCE_COCO_TMUX", "0")
 
 	tmpDir := t.TempDir()
 	argsPath := filepath.Join(tmpDir, "args.txt")
@@ -83,6 +87,8 @@ func TestCocoExecutorExecuteAllowsCLIToExitAfterQueryTimeout(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script test is unix-only")
 	}
+	// Keep tests deterministic: do not depend on tmux availability.
+	t.Setenv("NEP2MIDSENCE_COCO_TMUX", "0")
 
 	tmpDir := t.TempDir()
 	script := strings.Join([]string{
@@ -107,6 +113,8 @@ func TestCocoExecutorExecuteReturnsErrorOnFailure(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script test is unix-only")
 	}
+	// Keep tests deterministic: do not depend on tmux availability.
+	t.Setenv("NEP2MIDSENCE_COCO_TMUX", "0")
 
 	tmpDir := t.TempDir()
 	script := strings.Join([]string{

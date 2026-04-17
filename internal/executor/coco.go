@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -55,13 +57,22 @@ func NewCocoExecutor(workDir string, timeout time.Duration) *CocoExecutor {
 
 // Execute runs a single Coco invocation with the given prompt
 func (c *CocoExecutor) Execute(ctx context.Context, prompt string) (*types.CocoOutput, error) {
-	args := []string{"-p", prompt}
-
 	if c.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, c.commandTimeout())
 		defer cancel()
 	}
+
+	// coco 在非 TTY 环境下可能无法正确启用其“操作文件/交互能力”。
+	// 如果环境支持 tmux，则将 `coco -p` 放到 tmux pane 里执行，以获得真实 TTY。
+	if shouldRunCocoInTmux() {
+		return c.executeCocoPromptInTmux(ctx, prompt)
+	}
+	return c.executeCocoPromptDirect(ctx, prompt)
+}
+
+func (c *CocoExecutor) executeCocoPromptDirect(ctx context.Context, prompt string) (*types.CocoOutput, error) {
+	args := []string{"-p", prompt}
 
 	start := time.Now()
 	cmd := exec.CommandContext(ctx, "coco", args...)
@@ -89,8 +100,135 @@ func (c *CocoExecutor) Execute(ctx context.Context, prompt string) (*types.CocoO
 
 	output.Success = true
 	output.ExitCode = 0
-
 	return output, nil
+}
+
+func shouldRunCocoInTmux() bool {
+	// Allow disabling tmux wrapper explicitly (useful for tests and constrained environments).
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("NEP2MIDSENCE_COCO_TMUX"))); v != "" {
+		switch v {
+		case "0", "false", "off", "no":
+			return false
+		case "1", "true", "on", "yes":
+			// fallthrough to capability check
+		default:
+			// Unknown value: be conservative and keep default behavior (auto-detect).
+		}
+	}
+	_, err := exec.LookPath("tmux")
+	return err == nil
+}
+
+func (c *CocoExecutor) executeCocoPromptInTmux(ctx context.Context, prompt string) (*types.CocoOutput, error) {
+	start := time.Now()
+
+	outFile, err := os.CreateTemp("", "nep2midsence-coco-tmux-out-*")
+	if err != nil {
+		return c.executeCocoPromptDirect(ctx, prompt)
+	}
+	outPath := outFile.Name()
+	_ = outFile.Close()
+	defer func() { _ = os.Remove(outPath) }()
+
+	exitFile, err := os.CreateTemp("", "nep2midsence-coco-tmux-exit-*")
+	if err != nil {
+		return c.executeCocoPromptDirect(ctx, prompt)
+	}
+	exitPath := exitFile.Name()
+	_ = exitFile.Close()
+	defer func() { _ = os.Remove(exitPath) }()
+
+	// Use a unique session + wait-for tokens to avoid cross-task collisions when scheduler runs in parallel.
+	session := fmt.Sprintf("nep2midsence-coco-%d-%d", time.Now().UnixNano(), os.Getpid())
+	startToken := session + "-start"
+	doneToken := session + "-done"
+	// Capture pane id from tmux to avoid user-configured base-index differences.
+	var paneTarget string
+
+	// Start a detached session that blocks until we finish wiring pipe-pane.
+	script := strings.Join([]string{
+		// wait for start signal from the parent process
+		"tmux wait-for \"$5\" || exit 125",
+		// ensure working directory
+		"cd \"$1\" || exit 126",
+		// run coco prompt
+		"coco -p \"$2\"",
+		// capture exit code
+		"code=$?; printf '%d' \"$code\" >\"$3\"",
+		// signal completion
+		"tmux wait-for -S \"$4\"",
+	}, "; ")
+
+	newArgs := []string{"new-session", "-d", "-P", "-F", "#{pane_id}", "-s", session, "sh", "-c", script, "sh", c.workDir, prompt, exitPath, doneToken, startToken}
+	cmd := exec.CommandContext(ctx, "tmux", newArgs...)
+	var paneID bytes.Buffer
+	cmd.Stdout = &paneID
+	if err := cmd.Run(); err != nil {
+		return c.executeCocoPromptDirect(ctx, prompt)
+	}
+	paneTarget = strings.TrimSpace(paneID.String())
+	if paneTarget == "" {
+		return c.executeCocoPromptDirect(ctx, prompt)
+	}
+
+	// Best-effort cleanup even when ctx is cancelled.
+	defer func() { _ = exec.Command("tmux", "kill-session", "-t", session).Run() }()
+	defer func() { _ = exec.Command("tmux", "pipe-pane", "-t", paneTarget).Run() }()
+
+	// Pipe pane output to a file while keeping coco attached to a real TTY.
+	pipeCmd := "cat >> " + shellQuotePath(outPath)
+	if err := exec.CommandContext(ctx, "tmux", "pipe-pane", "-t", paneTarget, "-o", pipeCmd).Run(); err != nil {
+		// If piping fails, fall back to direct execution to avoid hanging.
+		return c.executeCocoPromptDirect(ctx, prompt)
+	}
+
+	// Signal session to start and then wait for completion.
+	if err := exec.CommandContext(ctx, "tmux", "wait-for", "-S", startToken).Run(); err != nil {
+		return c.executeCocoPromptDirect(ctx, prompt)
+	}
+
+	waitErr := exec.CommandContext(ctx, "tmux", "wait-for", doneToken).Run()
+	duration := time.Since(start)
+
+	outBytes, _ := os.ReadFile(outPath)
+	combined := string(outBytes)
+
+	output := &types.CocoOutput{Output: combined, Duration: duration}
+	// If we failed to wait due to timeout/cancel, return as executor failure.
+	if waitErr != nil {
+		output.Success = false
+		output.ExitCode = 124
+		_ = exec.Command("tmux", "kill-session", "-t", session).Run()
+		return output, c.formatExecuteError(ctx, waitErr, combined)
+	}
+
+	exitData, readErr := os.ReadFile(exitPath)
+	if readErr != nil {
+		output.Success = false
+		output.ExitCode = 1
+		return output, c.formatExecuteError(ctx, readErr, combined)
+	}
+	codeStr := strings.TrimSpace(string(exitData))
+	code, convErr := strconv.Atoi(codeStr)
+	if convErr != nil {
+		output.Success = false
+		output.ExitCode = 1
+		return output, c.formatExecuteError(ctx, convErr, combined)
+	}
+
+	if code != 0 {
+		output.Success = false
+		output.ExitCode = code
+		return output, c.formatExecuteError(ctx, fmt.Errorf("exit code %d", code), combined)
+	}
+
+	output.Success = true
+	output.ExitCode = 0
+	return output, nil
+}
+
+func shellQuotePath(path string) string {
+	return "'" + strings.ReplaceAll(path, "'", "'\"'\"'") + "'"
 }
 
 func (c *CocoExecutor) commandTimeout() time.Duration {
