@@ -50,15 +50,15 @@ type AnalysisConfig struct {
 }
 
 type CocoConfig struct {
-	MaxTurns     int      `json:"max_turns" yaml:"max_turns"`
-	AllowedTools []string `json:"allowed_tools" yaml:"allowed_tools"`
-	Timeout      string   `json:"timeout" yaml:"timeout"`
-	OutputFormat string   `json:"output_format" yaml:"output_format"`
+	Timeout string `json:"timeout" yaml:"timeout"`
 }
 
 type ExecutionConfig struct {
-	RetryLimit int `json:"retry_limit" yaml:"retry_limit"`
-	MaxJobs    int `json:"max_jobs" yaml:"max_jobs"`
+	// Tool selects which external CLI to run for prompt execution.
+	// Supported: coco, cc (claude-code), codex.
+	Tool       string `json:"tool" yaml:"tool"`
+	RetryLimit int    `json:"retry_limit" yaml:"retry_limit"`
+	MaxJobs    int    `json:"max_jobs" yaml:"max_jobs"`
 }
 
 type TSExtractorConfig struct {
@@ -79,15 +79,15 @@ func DefaultConfig() *Config {
 			FilePatterns: []string{}, PackagePrefixes: []string{},
 			CustomMappings: make(map[string]string),
 		},
-		Target:   TargetConfig{OutputDir: "output", FileSuffix: "_converted"},
-		Analysis: AnalysisConfig{MaxCallDepth: 5, MaxFiles: 50, EnableDataflow: true, EnableIntent: true},
+		Target:         TargetConfig{OutputDir: "output", FileSuffix: "_converted"},
+		Analysis:       AnalysisConfig{MaxCallDepth: 5, MaxFiles: 50, EnableDataflow: true, EnableIntent: true},
 		CustomMappings: make(map[string]string),
-		Coco: CocoConfig{MaxTurns: 10, AllowedTools: []string{}, Timeout: "30s", OutputFormat: "json"},
-		Execution:   ExecutionConfig{RetryLimit: 3, MaxJobs: 4},
-		MigrationDoc: "",
-		TSExtractor: TSExtractorConfig{NodePath: "node", ScriptPath: "scripts/dist/ts-ast-extractor.js", Timeout: 30},
-		Fingerprint: FingerprintConfig{CustomMappings: make(map[string]string)},
-		SourceDir: ".", Workers: 4,
+		Coco:           CocoConfig{Timeout: "30s"},
+		Execution:      ExecutionConfig{Tool: "coco", RetryLimit: 3, MaxJobs: 4},
+		MigrationDoc:   "",
+		TSExtractor:    TSExtractorConfig{NodePath: "node", ScriptPath: "scripts/dist/ts-ast-extractor.js", Timeout: 30},
+		Fingerprint:    FingerprintConfig{CustomMappings: make(map[string]string)},
+		SourceDir:      ".", Workers: 4,
 	}
 }
 
@@ -160,4 +160,19 @@ func (c *Config) ToMap() map[string]interface{} {
 		m[k] = v
 	}
 	return m
+}
+
+
+// ConfigDir returns the directory containing the configuration file.
+// This is used as the project root for storing state and other artifacts,
+// ensuring they are never written into user-selected scan directories.
+func (c *Config) ConfigDir() string {
+	if c.configPath == "" {
+		return "."
+	}
+	dir := filepath.Dir(c.configPath)
+	if dir == "" {
+		return "."
+	}
+	return dir
 }

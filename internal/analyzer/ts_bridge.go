@@ -1,6 +1,7 @@
 package analyzer
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,12 +13,12 @@ import (
 
 // TSExtractResult is the raw JSON output from the TypeScript extractor script.
 type TSExtractResult struct {
-	FilePath  string           `json:"filePath"`
-	Imports   []tsImportEntry  `json:"imports"`
-	Functions []tsFuncEntry    `json:"functions"`
-	Calls     []tsCallEntry    `json:"calls"`
-	Constants []tsConstEntry   `json:"constants"`
-	Variables []tsVarEntry     `json:"variables"`
+	FilePath  string          `json:"filePath"`
+	Imports   []tsImportEntry `json:"imports"`
+	Functions []tsFuncEntry   `json:"functions"`
+	Calls     []tsCallEntry   `json:"calls"`
+	Constants []tsConstEntry  `json:"constants"`
+	Variables []tsVarEntry    `json:"variables"`
 }
 
 type tsImportEntry struct {
@@ -42,6 +43,7 @@ type tsFuncEntry struct {
 
 type tsCallEntry struct {
 	Receiver  string   `json:"receiver,omitempty"`
+	FullReceiver string `json:"fullReceiver,omitempty"`
 	FuncName  string   `json:"funcName"`
 	Args      []string `json:"args,omitempty"`
 	Line      int      `json:"line"`
@@ -49,6 +51,7 @@ type tsCallEntry struct {
 	IsNep     bool     `json:"isNep"`
 	IsAwait   bool     `json:"isAwait"`
 	IsChained bool     `json:"isChained"`
+	IsWrapperCall bool `json:"isWrapperCall,omitempty"`
 	Callee    string   `json:"callee,omitempty"`
 	InFunc    string   `json:"inFunc,omitempty"`
 }
@@ -115,8 +118,20 @@ func (b *TSBridge) Extract(filePaths []string) ([]TSExtractResult, error) {
 		return nil, fmt.Errorf("tsbridge: extraction failed: %w", err)
 	}
 
+	trimmed := bytes.TrimSpace(out)
+	if len(trimmed) == 0 {
+		return nil, fmt.Errorf("tsbridge: empty extraction output")
+	}
+
 	var results []TSExtractResult
-	if err := json.Unmarshal(out, &results); err != nil {
+	if trimmed[0] == '{' {
+		var single TSExtractResult
+		if err := json.Unmarshal(trimmed, &single); err != nil {
+			return nil, fmt.Errorf("tsbridge: failed to parse extraction output: %w", err)
+		}
+		return []TSExtractResult{single}, nil
+	}
+	if err := json.Unmarshal(trimmed, &results); err != nil {
 		return nil, fmt.Errorf("tsbridge: failed to parse extraction output: %w", err)
 	}
 
@@ -190,6 +205,7 @@ func (b *TSBridge) ConvertAllCalls(r TSExtractResult) []types.CallStep {
 	for _, c := range r.Calls {
 		steps = append(steps, types.CallStep{
 			Receiver:  c.Receiver,
+			FullReceiver: c.FullReceiver,
 			FuncName:  c.FuncName,
 			Args:      c.Args,
 			Line:      c.Line,
@@ -197,6 +213,7 @@ func (b *TSBridge) ConvertAllCalls(r TSExtractResult) []types.CallStep {
 			IsNepAPI:  c.IsNepAPI,
 			IsAwait:   c.IsAwait,
 			IsChained: c.IsChained,
+			IsWrapperCall: c.IsWrapperCall,
 			Callee:    c.Callee,
 			InFunc:    c.InFunc,
 		})

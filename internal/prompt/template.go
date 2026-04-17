@@ -31,9 +31,24 @@ const migrationTemplate = `## 迁移任务
 以下是原始 case 展开后的完整操作序列：
 
 {{range .OperationSteps -}}
-**Step {{add .Index 1}}**: {{.Intent}}
+**Step {{add .Index 1}}** [{{.StepType}}]: {{.Intent}}
   原始调用: ` + "`" + `{{.NepCall}}` + "`" + `
   目标写法: ` + "`" + `{{.MidsceneCall}}` + "`" + `
+
+{{end}}
+
+{{if .DefaultPrompts}}
+---
+
+### 3.5 组件 DEFAULT_PROMPT 映射
+
+以下是封装组件的 ` + "`" + `DEFAULT_PROMPT` + "`" + ` 描述，迁移时应优先使用这些描述生成 midscene agent 的自然语言参数：
+
+| 组件类名 | DEFAULT_PROMPT 描述 | 来源文件 |
+|---|---|---|
+{{range .DefaultPrompts -}}
+| ` + "`" + `{{.ClassName}}` + "`" + ` | {{.PromptValue}} | ` + "`" + `{{.FilePath}}` + "`" + ` |
+{{end}}
 
 {{end}}
 
@@ -65,16 +80,25 @@ const migrationTemplate = `## 迁移任务
 
 ### 6. 原始代码
 
-` + "```go" + `
-{{.SourceCode}}
-` + "```" + `
+本次迁移 **不要在 prompt 内联源码**。请通过 ` + "`" + `Read` + "`" + ` / ` + "`" + `Grep` + "`" + ` 工具读取以下文件内容后再开始修改：
 
-{{if .HelperCode}}
-### 6.1 依赖的 Helper/Page Object 代码
+- 源文件（需要迁移的 case/helper）：` + "`" + `{{.SourceFile}}` + "`" + `
+- 目标输出文件（将迁移后的代码写入此路径）：` + "`" + `{{.TargetFile}}` + "`" + `
 
-` + "```go" + `
-{{.HelperCode}}
-` + "```" + `
+{{if .ReferenceDocs}}
+#### 6.1 参考文档（先读）
+
+{{range .ReferenceDocs -}}
+- ` + "`" + `{{.}}` + "`" + `
+{{end}}
+{{end}}
+
+{{if .RelatedFiles}}
+#### 6.2 相关代码文件（按需 Read/Grep，用于封装函数/PO/helper 上下文）
+
+{{range .RelatedFiles -}}
+- ` + "`" + `{{.}}` + "`" + `
+{{end}}
 {{end}}
 
 {{if .ExampleBefore}}
@@ -83,12 +107,12 @@ const migrationTemplate = `## 迁移任务
 ### 7. 参考示例
 
 **迁移前：**
-` + "```go" + `
+` + "```" + `{{.CodeFenceLang}}
 {{.ExampleBefore}}
 ` + "```" + `
 
 **迁移后：**
-` + "```go" + `
+` + "```" + `{{.CodeFenceLang}}
 {{.ExampleAfter}}
 ` + "```" + `
 {{end}}

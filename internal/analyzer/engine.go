@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/sandaogouchen/nep2midsence/internal/config"
 	"github.com/sandaogouchen/nep2midsence/internal/fingerprint"
@@ -20,6 +21,7 @@ type Engine struct {
 	patternDetector   *PatternDetector
 	intentAnalyzer    *IntentAnalyzer
 	annotator         *fingerprint.Annotator
+	tsBridge          *TSBridge
 }
 
 func NewEngine(cfg *config.Config) *Engine {
@@ -42,6 +44,7 @@ func NewEngine(cfg *config.Config) *Engine {
 		patternDetector:   NewPatternDetector(),
 		intentAnalyzer:    NewIntentAnalyzer(),
 		annotator:         fingerprint.NewAnnotator(customMappings),
+		tsBridge:          newTSBridgeFromConfig(cfg),
 	}
 }
 
@@ -51,6 +54,14 @@ func (e *Engine) AnalyzeFile(filePath string) (*types.FullAnalysis, error) {
 		FilePath: filePath,
 	}
 
+	if isTypeScriptLikeFile(filePath) {
+		return e.analyzeTypeScriptFile(filePath, result)
+	}
+
+	return e.analyzeGoFile(filePath, result)
+}
+
+func (e *Engine) analyzeGoFile(filePath string, result *types.FullAnalysis) (*types.FullAnalysis, error) {
 	// L1: AST structure
 	astInfo, err := e.astAnalyzer.Analyze(filePath)
 	if err != nil {
@@ -94,6 +105,44 @@ func (e *Engine) AnalyzeFile(filePath string) (*types.FullAnalysis, error) {
 	return result, nil
 }
 
+func (e *Engine) analyzeTypeScriptFile(filePath string, result *types.FullAnalysis) (*types.FullAnalysis, error) {
+	astInfo, allCalls, language, err := e.extractTypeScript(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("L1 TS analysis failed for %s: %w", filePath, err)
+	}
+
+	result.AST = astInfo
+	result.Package = astInfo.Package
+	result.Language = language
+
+	astInfoMap := map[string]*types.ASTInfo{filePath: astInfo}
+	e.callGraphAnalyzer.SetASTInfos(astInfoMap)
+
+	chains := e.callGraphAnalyzer.BuildChainsFromTSCalls(astInfo, allCalls)
+	result.CallChains = chains
+
+	annotated := e.annotator.Annotate(chains)
+	result.APIMappings = annotated
+
+	if e.cfg.Analysis.EnableDataflow {
+		result.DataFlows = e.dataFlowAnalyzer.AnalyzeTS(astInfo, chains)
+	}
+
+	patternResult := e.patternDetector.Detect(astInfo, chains)
+	e.patternDetector.DetectTS(astInfo, chains, patternResult)
+	patternResult.Complexity = classifyPatternComplexity(len(patternResult.Detected))
+	result.Patterns = patternResult
+	result.Complexity = patternResult.Complexity
+
+	if e.cfg.Analysis.EnableIntent {
+		result.Intents = e.intentAnalyzer.Analyze(chains, astInfo)
+	}
+
+	result.TargetPath = e.computeTargetPath(filePath)
+
+	return result, nil
+}
+
 // AnalyzeDir analyzes all matching files in a directory
 func (e *Engine) AnalyzeDir(dir string) ([]*types.FullAnalysis, error) {
 	var results []*types.FullAnalysis
@@ -124,11 +173,34 @@ func (e *Engine) AnalyzeDir(dir string) ([]*types.FullAnalysis, error) {
 }
 
 func (e *Engine) matchesPattern(name string) bool {
-	for _, pattern := range e.cfg.Source.FilePatterns {
-		if matched, _ := filepath.Match(pattern, name); matched {
-			return true
+	// Check FilePatterns and Extensions independently; a match in either is sufficient.
+	// This ensures TypeScript files (matched by Extensions) are not excluded when
+	// FilePatterns only lists Go-specific globs like "*_test.go".
+	hasPatterns := len(e.cfg.Source.FilePatterns) > 0
+	hasExtensions := len(e.cfg.Source.Extensions) > 0
+
+	if hasPatterns {
+		for _, pattern := range e.cfg.Source.FilePatterns {
+			if matched, _ := filepath.Match(pattern, name); matched {
+				return true
+			}
 		}
 	}
+
+	if hasExtensions {
+		ext := filepath.Ext(name)
+		for _, allowed := range e.cfg.Source.Extensions {
+			if ext == allowed {
+				return true
+			}
+		}
+	}
+
+	// If neither filter is configured, accept all files.
+	if !hasPatterns && !hasExtensions {
+		return true
+	}
+
 	return false
 }
 
@@ -144,4 +216,62 @@ func (e *Engine) computeTargetPath(sourcePath string) string {
 	}
 
 	return filepath.Join(targetDir, base)
+}
+
+func (e *Engine) extractTypeScript(filePath string) (*types.ASTInfo, []types.CallStep, string, error) {
+	if e.tsBridge != nil && tsBridgeScriptExists(e.tsBridge.scriptPath) {
+		results, err := e.tsBridge.Extract([]string{filePath})
+		if err == nil && len(results) > 0 {
+			astInfo := e.tsBridge.ConvertToASTInfo(results[0])
+			return astInfo, e.tsBridge.ConvertAllCalls(results[0]), tsLanguageForPath(filePath), nil
+		}
+	}
+
+	return extractTypeScriptFallback(filePath)
+}
+
+func newTSBridgeFromConfig(cfg *config.Config) *TSBridge {
+	if cfg == nil {
+		return nil
+	}
+
+	timeout := time.Duration(cfg.TSExtractor.Timeout) * time.Second
+	return NewTSBridge(cfg.TSExtractor.NodePath, cfg.TSExtractor.ScriptPath, timeout)
+}
+
+func isTypeScriptLikeFile(filePath string) bool {
+	switch strings.ToLower(filepath.Ext(filePath)) {
+	case ".ts", ".tsx", ".js", ".jsx":
+		return true
+	default:
+		return false
+	}
+}
+
+func tsLanguageForPath(filePath string) string {
+	switch strings.ToLower(filepath.Ext(filePath)) {
+	case ".js", ".jsx":
+		return "javascript"
+	default:
+		return "typescript"
+	}
+}
+
+func tsBridgeScriptExists(scriptPath string) bool {
+	if scriptPath == "" {
+		return false
+	}
+	info, err := os.Stat(scriptPath)
+	return err == nil && !info.IsDir()
+}
+
+func classifyPatternComplexity(count int) string {
+	switch {
+	case count <= 1:
+		return "simple"
+	case count <= 3:
+		return "medium"
+	default:
+		return "complex"
+	}
 }

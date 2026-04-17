@@ -10,12 +10,12 @@ import (
 	"github.com/sandaogouchen/nep2midsence/internal/types"
 )
 
-// ProgressCallback is called after each task completes
-type ProgressCallback func(file string, success bool, current, total int)
+// ProgressCallback is called after each task completes.
+type ProgressCallback func(result *types.MigrationResult, current, total int)
 
 // Scheduler orchestrates parallel execution of migration tasks
 type Scheduler struct {
-	executor   *CocoExecutor
+	executor   PromptExecutor
 	generator  *prompt.Generator
 	maxJobs    int
 	retryLimit int
@@ -23,7 +23,7 @@ type Scheduler struct {
 }
 
 // NewScheduler creates a new Scheduler
-func NewScheduler(executor *CocoExecutor, generator *prompt.Generator, maxJobs, retryLimit int) *Scheduler {
+func NewScheduler(executor PromptExecutor, generator *prompt.Generator, maxJobs, retryLimit int) *Scheduler {
 	if maxJobs <= 0 {
 		maxJobs = 1
 	}
@@ -68,7 +68,7 @@ func (s *Scheduler) Run(ctx context.Context, analyses []*types.FullAnalysis) []*
 			mu.Unlock()
 
 			if s.onProgress != nil {
-				s.onProgress(a.FilePath, result.Success, current, total)
+				s.onProgress(result, current, total)
 			}
 		}(i, analysis)
 	}

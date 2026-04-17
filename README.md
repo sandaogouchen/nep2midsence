@@ -2,7 +2,7 @@
 
 > nep → midscene 自动化 Case 批量迁移工具
 
-nep2midsence 是一个 Go CLI 工具，通过多层次静态分析理解原始 nep case 的语义结构，生成结构化迁移指令，然后调起本地的 Coco（Claude Code CLI）执行实际代码改写，实现大批量 case 迁移的半自动化。
+nep2midsence 是一个全屏交互式 Go CLI，通过多层次静态分析理解原始 nep case 的语义结构，生成结构化迁移指令，然后调起本地的 Coco（Claude Code CLI）执行实际代码改写，实现大批量 case 迁移的半自动化。
 
 ## 核心特性
 
@@ -31,11 +31,7 @@ nep2midsence 是一个 Go CLI 工具，通过多层次静态分析理解原始 n
 go install github.com/sandaogouchen/nep2midsence/cmd/nep2midsence@latest
 ```
 
-安装后即可直接使用：
-
-```bash
-nep2midsence version
-```
+安装后直接运行 `nep2midsence` 即可进入全屏交互界面。
 
 > 如果提示 `command not found`，请确保 `$GOPATH/bin` 在 PATH 中：
 > ```bash
@@ -74,7 +70,7 @@ make build
 
 ```bash
 # 方式 A：直接用相对路径运行
-./nep2midsence start --dir ./tests/e2e/login
+./nep2midsence
 
 # 方式 B：复制到 PATH 中的目录
 sudo cp ./nep2midsence /usr/local/bin/
@@ -85,53 +81,51 @@ make install-global
 ### 验证安装
 
 ```bash
-nep2midsence version
+nep2midsence
 ```
 
 预期输出：
 
-```
-nep2midsence 0.1.0
-  Build Date: 2026-04-16T00:00:00Z
-  Git Commit: abc1234
+```text
+启动后进入全屏交互界面，底部输入栏可输入 slash command。
 ```
 
-### 使用
+### 交互式使用
 
 ```bash
-# 在项目根目录运行完整迁移流程
-nep2midsence start --dir ./tests/e2e/login
+# 启动全屏 TUI
+nep2midsence
 
-# 仅分析（dry-run）
-nep2midsence start --dir ./tests/e2e/login --dry-run
-
-# 并发执行
-nep2midsence start --dir ./tests/e2e/ -j 4
-
-# 仅执行分析，输出 JSON
-nep2midsence analyze --dir ./tests/e2e/ -o analysis.json
-
-# 查看版本
-nep2midsence version
+# 指定配置文件启动
+nep2midsence --config /path/to/.nep2midsence.yaml
 ```
 
-## 命令说明
+启动后可使用以下命令：
 
 | 命令 | 说明 |
 |---|---|
-| `start` | 完整流程：分析 → 生成 → 执行 → 验证 |
-| `analyze` | 仅执行分析阶段 |
-| `version` | 查看版本信息 |
+| `/help` | 查看可用命令 |
+| `/start` | 选择目标目录并执行完整流程：分析 → 生成 → 执行 → 验证 |
+| `/analyze` | 选择目标目录并仅执行分析 |
+| `/status` | 查看最近一次持久化运行状态 |
+| `/history` | 查看历史运行记录 |
+| `/config` | 查看当前配置 |
+| `/config set <key> <value>` | 修改运行时配置 |
+| `/config save` | 保存当前配置 |
+| `/version` | 查看版本信息 |
+| `/clear` | 清空当前会话日志 |
+| `/quit` | 退出 TUI |
 
-### `start` 参数
+### 目录选择
+
+`/start` 和 `/analyze` 都会先打开目录选择器。进入后可在顶部输入框直接模糊搜索目录，再用方向键和回车确认开始执行。
+
+### 根级启动参数
 
 | 参数 | 说明 | 默认值 |
 |---|---|---|
-| `--dir` | 目标文件夹 | 交互选择 |
-| `--dry-run` | 只生成计划不执行 | false |
-| `-j, --jobs` | 并发数 | 1 |
 | `--config` | 配置文件路径 | `.nep2midsence.yaml` |
-| `--verbose` | 详细日志 | false |
+| `--verbose` | 详细日志输出 | false |
 
 ## 配置文件
 
@@ -150,8 +144,8 @@ target:
   output_dir: "midscene"
 
 coco:
-  max_turns: 15
   timeout: "3m"
+  output_format: "json"
   allowed_tools:
     - "Read"
     - "Write"
@@ -164,17 +158,19 @@ execution:
 ```
 
 > **向后兼容**：工具也会自动识别旧的 `.casemover.yaml` 配置文件。
+>
+> `max_turns` 仍会被读取，但当前 `coco` CLI 不支持该参数，执行时不会再透传给 `coco`。
 
 ## 架构设计
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│                    nep2midsence CLI                        │
+│                  nep2midsence Full-screen TUI              │
 ├────────────┬───────────────┬───────────────┬───────────────┤
-│  CLI 入口   │  分析引擎      │  Prompt 生成器 │  Coco 调度器   │
-│  (cobra)   │  (5层分析)     │  (模板+上下文)  │  (exec+并发)  │
+│  TUI 状态机  │  分析引擎      │  Prompt 生成器 │  Coco 调度器   │
+│ (BubbleTea) │  (5层分析)     │  (模板+上下文)  │  (exec+并发)  │
 ├────────────┴───────────────┴───────────────┴───────────────┤
-│                     验证 & 报告模块                          │
+│                状态持久化 / 验证 / 报告模块                 │
 └────────────────────────────────────────────────────────────┘
 ```
 

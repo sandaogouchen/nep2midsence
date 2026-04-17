@@ -40,3 +40,8 @@ func (c *Config) Save(path ...string) error {
 	c.configPath = target
 	return nil
 }
+
+// UsePath sets the preferred config file path for subsequent Save calls.
+func (c *Config) UsePath(path string) {
+	c.configPath = path
+}

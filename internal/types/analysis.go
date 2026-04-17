@@ -15,6 +15,10 @@ type FullAnalysis struct {
 	Intents      []*IntentInfo    `json:"intents"`
 	APIMappings  []*AnnotatedCall `json:"api_mappings"`
 	Dependencies []string         `json:"dependencies"`
+
+	// DefaultPrompts collects component-level DEFAULT_PROMPT strings (NEP-specific
+	// AI element descriptions) discovered from dependent files.
+	DefaultPrompts []DefaultPromptInfo `json:"default_prompts,omitempty"`
 }
 
 // ASTInfo holds L1 AST structural analysis results
@@ -91,4 +95,13 @@ type InitInfo struct {
 	LineStart int    `json:"line_start"`
 	LineEnd   int    `json:"line_end"`
 	Body      string `json:"body"`
+}
+
+// DefaultPromptInfo captures a component class's static DEFAULT_PROMPT value.
+// This is used to guide Midscene AI intent generation during migration.
+type DefaultPromptInfo struct {
+	ClassName   string `json:"class_name"`
+	PromptValue string `json:"prompt_value"`
+	FilePath    string `json:"file_path"`
+	Line        int    `json:"line,omitempty"`
 }
