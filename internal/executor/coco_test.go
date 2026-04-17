@@ -75,6 +75,7 @@ func TestCocoExecutorExecuteBuildsSupportedCLIArgs(t *testing.T) {
 
 	got := strings.Fields(string(argsData))
 	want := []string{
+		"-y",
 		"-p",
 		"你是谁",
 	}

@@ -64,7 +64,7 @@ func (c *CocoExecutor) Execute(ctx context.Context, prompt string) (*types.CocoO
 	}
 
 	// coco 在非 TTY 环境下可能无法正确启用其“操作文件/交互能力”。
-	// 如果环境支持 tmux，则将 `coco -p` 放到 tmux pane 里执行，以获得真实 TTY。
+	// 如果环境支持 tmux，则将 `coco -y -p` 放到 tmux pane 里执行，以获得真实 TTY。
 	if shouldRunCocoInTmux() {
 		return c.executeCocoPromptInTmux(ctx, prompt)
 	}
@@ -72,7 +72,7 @@ func (c *CocoExecutor) Execute(ctx context.Context, prompt string) (*types.CocoO
 }
 
 func (c *CocoExecutor) executeCocoPromptDirect(ctx context.Context, prompt string) (*types.CocoOutput, error) {
-	args := []string{"-p", prompt}
+	args := []string{"-y", "-p", prompt}
 
 	start := time.Now()
 	cmd := exec.CommandContext(ctx, "coco", args...)
@@ -139,20 +139,20 @@ func (c *CocoExecutor) executeCocoPromptInTmux(ctx context.Context, prompt strin
 	defer func() { _ = os.Remove(exitPath) }()
 
 	// Use a unique session + wait-for tokens to avoid cross-task collisions when scheduler runs in parallel.
-	session := fmt.Sprintf("nep2midsence-coco-%d-%d", time.Now().UnixNano(), os.Getpid())
+		session := fmt.Sprintf("nep2midsence-coco-%d-%d", time.Now().UnixNano(), os.Getpid())
 	startToken := session + "-start"
 	doneToken := session + "-done"
 	// Capture pane id from tmux to avoid user-configured base-index differences.
 	var paneTarget string
 
 	// Start a detached session that blocks until we finish wiring pipe-pane.
-	script := strings.Join([]string{
+		script := strings.Join([]string{
 		// wait for start signal from the parent process
 		"tmux wait-for \"$5\" || exit 125",
 		// ensure working directory
 		"cd \"$1\" || exit 126",
 		// run coco prompt
-		"coco -p \"$2\"",
+		"coco -y -p \"$2\"",
 		// capture exit code
 		"code=$?; printf '%d' \"$code\" >\"$3\"",
 		// signal completion

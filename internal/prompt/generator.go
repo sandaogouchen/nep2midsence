@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"text/template"
@@ -184,6 +185,9 @@ func (g *Generator) buildPromptData(analysis *types.FullAnalysis) *PromptData {
 
 		for localIdx, step := range chain.Steps {
 			if !step.IsNepAPI && !step.IsWrapperCall {
+				continue
+			}
+			if shouldSkipPromptStep(step, g.cfg) {
 				continue
 			}
 
@@ -555,6 +559,65 @@ func (g *Generator) estimateTokens(data *PromptData) int {
 	var buf bytes.Buffer
 	g.tmpl.Execute(&buf, data)
 	return buf.Len() / 4 // rough estimation: 1 token ~ 4 chars
+}
+
+func shouldSkipPromptStep(step types.CallStep, cfg *config.Config) bool {
+	if step.OwnerKind == "infrastructure" {
+		return true
+	}
+	if cfg != nil {
+		if matchesPromptPatterns(step.Callee, cfg.WrapperFilter.ForceInfraCallPatterns) {
+			return true
+		}
+		if containsPromptName(cfg.WrapperFilter.ForceInfraMethods, step.FuncName) {
+			return true
+		}
+	}
+	if step.IsWrapperCall && !step.IsNepAPI && isPromptInfrastructureStep(step) {
+		return true
+	}
+	return false
+}
+
+func isPromptInfrastructureStep(step types.CallStep) bool {
+	switch strings.TrimSpace(step.FuncName) {
+	case "log", "info", "warn", "error", "debug", "stringify", "parse", "expect", "assert":
+		return true
+	}
+	for _, prefix := range []string{"console.", "JSON.", "Math.", "Object.", "Array.", "Promise.", "expect.", "assert."} {
+		if strings.HasPrefix(step.Callee, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesPromptPatterns(value string, patterns []string) bool {
+	for _, pattern := range patterns {
+		pattern = strings.TrimSpace(pattern)
+		if pattern == "" {
+			continue
+		}
+		matched, err := filepath.Match(pattern, value)
+		if err == nil && matched {
+			return true
+		}
+		matched, err = regexp.MatchString(pattern, value)
+		if err == nil && matched {
+			return true
+		}
+	}
+	return false
+}
+
+func containsPromptName(items []string, value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	for _, item := range items {
+		if value == strings.ToLower(strings.TrimSpace(item)) {
+			return true
+		}
+	}
+	return false
 }
 
 // GenerateRetryPrompt creates an enriched prompt for retry attempts

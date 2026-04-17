@@ -3,18 +3,20 @@ package analyzer
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
+	"github.com/sandaogouchen/nep2midsence/internal/config"
 	"github.com/sandaogouchen/nep2midsence/internal/types"
 )
 
 var (
-	tsImportFromRe  = regexp.MustCompile(`^\s*import\s+(.+?)\s+from\s+['"]([^'"]+)['"]`)
-	tsImportBareRe  = regexp.MustCompile(`^\s*import\s+['"]([^'"]+)['"]`)
-	tsVarDeclRe     = regexp.MustCompile(`^\s*(?:export\s+)?(const|let|var)\s+([A-Za-z_$][\w$]*)[^=]*=\s*(.+?)\s*;?\s*$`)
-	tsFnDeclRe      = regexp.MustCompile(`^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(`)
-	tsArrowFnDeclRe = regexp.MustCompile(`^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>`)
+	tsImportFromRe   = regexp.MustCompile(`^\s*import\s+(.+?)\s+from\s+['"]([^'"]+)['"]`)
+	tsImportBareRe   = regexp.MustCompile(`^\s*import\s+['"]([^'"]+)['"]`)
+	tsVarDeclRe      = regexp.MustCompile(`^\s*(?:export\s+)?(const|let|var)\s+([A-Za-z_$][\w$]*)[^=]*=\s*(.+?)\s*;?\s*$`)
+	tsFnDeclRe       = regexp.MustCompile(`^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(`)
+	tsArrowFnDeclRe  = regexp.MustCompile(`^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>`)
 	tsTestCallRe     = regexp.MustCompile(`\b(it|test)\s*\(\s*['"` + "`" + `]([^'"` + "`" + `]+)['"` + "`" + `]\s*,`)
 	tsTestCallBareRe = regexp.MustCompile(`^\s*(?:commonIt|it|test)\s*\(\s*$`)
 	tsTestNameRe     = regexp.MustCompile(`^\s*['"` + "`" + `]([^'"` + "`" + `]+)['"` + "`" + `]\s*,`)
@@ -23,7 +25,7 @@ var (
 	//   adGroupPage.optimizationAndBiddingModule1MNBA.vv_setStandardBtn(
 	// Group 1: optional receiver chain with trailing dot ("adGroupPage.optimization...")
 	// Group 2: terminal function/method name ("vv_setStandardBtn")
-	tsCallRe        = regexp.MustCompile(`((?:[A-Za-z_$][\w$]*\.)+)?([A-Za-z_$][\w$]*)\s*\(`)
+	tsCallRe = regexp.MustCompile(`((?:[A-Za-z_$][\w$]*\.)+)?([A-Za-z_$][\w$]*)\s*\(`)
 	// component prompt extraction
 	tsClassDeclRe       = regexp.MustCompile(`\bclass\s+([A-Za-z_$][\w$]*)`)
 	tsDefaultPromptHint = "DEFAULT_PROMPT"
@@ -88,6 +90,25 @@ func ExtractDefaultPrompts(filePath string) []types.DefaultPromptInfo {
 	return out
 }
 
+var tsNewInstanceRe = regexp.MustCompile(`\bnew\s+([A-Za-z_$][\w$]*)\b`)
+
+var obviousInfraSegments = map[string]struct{}{
+	"logger":         {},
+	"console":        {},
+	"json":           {},
+	"math":           {},
+	"promise":        {},
+	"process":        {},
+	"sessionstorage": {},
+	"localstorage":   {},
+}
+
+var promptSafetyInfraMethods = map[string]struct{}{
+	"log": {}, "info": {}, "warn": {}, "error": {}, "debug": {},
+	"stringify": {}, "parse": {},
+	"expect": {}, "assert": {},
+}
+
 var tsNepAPIs = map[string]struct{}{
 	"navigate": {}, "goto": {}, "navigateTo": {},
 	"click": {}, "dblclick": {}, "clickLogin": {}, "clickCreateCampaign": {},
@@ -97,12 +118,12 @@ var tsNepAPIs = map[string]struct{}{
 	"findElements": {}, "querySelectorAll": {},
 	"waitForElement": {}, "waitForSelector": {},
 	"waitForNavigation": {}, "waitForTimeout": {},
-	"assertVisible": {}, "assertText": {}, "assertExists": {}, "expect": {},
+	"assertVisible": {}, "assertText": {}, "assertExists": {},
 	"getText": {}, "getInnerText": {}, "getAttribute": {},
 	"create": {}, "close": {}, "login": {},
 }
 
-func extractTypeScriptFallback(filePath string) (*types.ASTInfo, []types.CallStep, string, error) {
+func extractTypeScriptFallback(filePath string, cfg *config.Config) (*types.ASTInfo, []types.CallStep, string, error) {
 	content, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("read file: %w", err)
@@ -189,7 +210,7 @@ func extractTypeScriptFallback(filePath string) (*types.ASTInfo, []types.CallSte
 		}
 	}
 
-	allCalls := collectTSCalls(filePath, lines, testRanges, hookRanges)
+	allCalls := collectTSCalls(filePath, lines, astInfo, cfg, testRanges, hookRanges)
 	return astInfo, allCalls, language, nil
 }
 
@@ -294,11 +315,12 @@ func findTSBlockEnd(lines []string, startIdx int) int {
 	return startIdx + 1
 }
 
-func collectTSCalls(filePath string, lines []string, ranges ...[]tsRange) []types.CallStep {
+func collectTSCalls(filePath string, lines []string, astInfo *types.ASTInfo, cfg *config.Config, ranges ...[]tsRange) []types.CallStep {
 	var allRanges []tsRange
 	for _, group := range ranges {
 		allRanges = append(allRanges, group...)
 	}
+	ownerCtx := buildTSOwnerContext(filePath, astInfo, cfg)
 
 	var steps []types.CallStep
 	for idx, line := range lines {
@@ -330,21 +352,26 @@ func collectTSCalls(filePath string, lines []string, ranges ...[]tsRange) []type
 			}
 
 			_, isNepAPI := tsNepAPIs[funcName]
+			ownerRoot, ownerKind, ownerSource, ownerFile := ownerCtx.classify(callee, fullReceiver, funcName)
 			steps = append(steps, types.CallStep{
-				Callee:    callee,
-				Receiver:  receiver,
-				FullReceiver: fullReceiver,
-				FuncName:  funcName,
-				Args:      args,
-				FilePath:  filePath,
-				Line:      lineNo,
-				IsNepAPI:  isNepAPI,
-				IsNep:     isNepAPI,
-				IsAwait:   strings.Contains(line[:match[0]], "await "),
-				IsChained: receiver != "",
-				IsWrapperCall: strings.Contains(fullReceiver, "."),
-				InFunc:    enclosingTSRangeName(lineNo, allRanges),
-				Comment:   strings.TrimSpace(line[endIdx:]),
+				Callee:        callee,
+				Receiver:      receiver,
+				FullReceiver:  fullReceiver,
+				FuncName:      funcName,
+				Args:          args,
+				FilePath:      filePath,
+				Line:          lineNo,
+				IsNepAPI:      isNepAPI,
+				IsNep:         isNepAPI,
+				IsAwait:       strings.Contains(line[:match[0]], "await "),
+				IsChained:     receiver != "",
+				IsWrapperCall: ownerKind == "business",
+				OwnerRoot:     ownerRoot,
+				OwnerKind:     ownerKind,
+				OwnerSource:   ownerSource,
+				OwnerFile:     ownerFile,
+				InFunc:        enclosingTSRangeName(lineNo, allRanges),
+				Comment:       strings.TrimSpace(line[endIdx:]),
 			})
 		}
 	}
@@ -361,6 +388,306 @@ func shouldSkipTSCall(call string) bool {
 	default:
 		return false
 	}
+}
+
+type tsOwnerContext struct {
+	filePath         string
+	cfg              config.WrapperFilterConfig
+	localImportFiles map[string]string
+	newInstanceRoots map[string]string
+}
+
+func buildTSOwnerContext(filePath string, astInfo *types.ASTInfo, cfg *config.Config) tsOwnerContext {
+	ctx := tsOwnerContext{
+		filePath:         filePath,
+		localImportFiles: make(map[string]string),
+		newInstanceRoots: make(map[string]string),
+	}
+	if cfg != nil {
+		ctx.cfg = cfg.WrapperFilter
+	} else {
+		ctx.cfg = config.DefaultConfig().WrapperFilter
+	}
+	if astInfo == nil {
+		return ctx
+	}
+
+	for _, imp := range astInfo.Imports {
+		if !isLocalImportPath(imp.Path) {
+			continue
+		}
+		resolved := resolveLocalImportFile(filePath, imp.Path)
+		if resolved == "" {
+			continue
+		}
+		for _, symbol := range extractImportSymbols(imp) {
+			ctx.localImportFiles[symbol] = resolved
+		}
+	}
+
+	for _, c := range astInfo.Constants {
+		if className := extractNewInstanceClass(c.Value); className != "" {
+			ctx.newInstanceRoots[c.Name] = className
+		}
+	}
+	for _, v := range astInfo.Variables {
+		if className := extractNewInstanceClass(v.Value); className != "" {
+			ctx.newInstanceRoots[v.Name] = className
+		}
+	}
+
+	return ctx
+}
+
+func (ctx tsOwnerContext) classify(callee, fullReceiver, funcName string) (string, string, string, string) {
+	ownerRoot := extractOwnerRoot(fullReceiver)
+	if ctx.isForceInfraMethod(funcName) {
+		return ownerRoot, "infrastructure", "config_force_infra_method", ctx.ownerFileForRoot(ownerRoot)
+	}
+	if matchesAnyPattern(callee, ctx.cfg.ForceInfraCallPatterns) {
+		return ownerRoot, "infrastructure", "config_force_infra", ""
+	}
+	if matchesAnyPattern(callee, ctx.cfg.ForceBusinessCallPatterns) {
+		return ownerRoot, "business", "config_force_business", ctx.ownerFileForRoot(ownerRoot)
+	}
+	if ownerRoot == "" {
+		if isPromptSafetyInfraCall(callee, funcName) {
+			return "", "infrastructure", "safety_no_receiver", ""
+		}
+		return "", "unknown", "no_owner_root", ""
+	}
+	if ctx.isKnownInfraRoot(ownerRoot) || hasObviousInfraSegment(fullReceiver) {
+		return ownerRoot, "infrastructure", "known_infra_root", ""
+	}
+	ownerFile := ctx.ownerFileForRoot(ownerRoot)
+	if ownerFile != "" {
+		if ctx.looksLikeElementAction(fullReceiver, funcName) {
+			return ownerRoot, "infrastructure", "element_like_property", ownerFile
+		}
+		return ownerRoot, "business", "local_import_owner", ownerFile
+	}
+	if className, ok := ctx.newInstanceRoots[ownerRoot]; ok {
+		ownerFile = ctx.localImportFiles[className]
+		if ctx.looksLikeElementAction(fullReceiver, funcName) {
+			return ownerRoot, "infrastructure", "element_like_property", ownerFile
+		}
+		if ownerFile != "" {
+			return ownerRoot, "business", "local_import_new_instance", ownerFile
+		}
+	}
+	if matchesAnyPattern(ownerRoot, ctx.cfg.KnownBusinessNamePatterns) {
+		if ctx.looksLikeElementAction(fullReceiver, funcName) {
+			return ownerRoot, "infrastructure", "element_like_property", ownerFile
+		}
+		return ownerRoot, "business", "business_name_pattern", ownerFile
+	}
+	if isPromptSafetyInfraCall(callee, funcName) || ctx.looksLikeElementAction(fullReceiver, funcName) {
+		return ownerRoot, "infrastructure", "safety_infra", ownerFile
+	}
+	return ownerRoot, "unknown", "fallback_unknown", ownerFile
+}
+
+func (ctx tsOwnerContext) ownerFileForRoot(root string) string {
+	if root == "" {
+		return ""
+	}
+	if className, ok := ctx.newInstanceRoots[root]; ok {
+		if ownerFile := ctx.localImportFiles[className]; ownerFile != "" {
+			return ownerFile
+		}
+	}
+	if ownerFile := ctx.localImportFiles[root]; ownerFile != "" {
+		return ownerFile
+	}
+	return ""
+}
+
+func (ctx tsOwnerContext) isKnownInfraRoot(root string) bool {
+	root = strings.ToLower(strings.TrimSpace(root))
+	for _, item := range ctx.cfg.KnownInfraRoots {
+		if root == strings.ToLower(strings.TrimSpace(item)) {
+			return true
+		}
+	}
+	return false
+}
+
+func (ctx tsOwnerContext) isForceInfraMethod(funcName string) bool {
+	return containsNormalized(ctx.cfg.ForceInfraMethods, funcName)
+}
+
+func (ctx tsOwnerContext) looksLikeElementAction(fullReceiver, funcName string) bool {
+	if !containsNormalized(ctx.cfg.InfraTerminalMethods, funcName) {
+		return false
+	}
+	for _, seg := range ownerPropertySegments(fullReceiver) {
+		if matchesAnyPattern(seg, ctx.cfg.ElementLikePropertyPatterns) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractOwnerRoot(fullReceiver string) string {
+	parts := strings.Split(fullReceiver, ".")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" || part == "this" {
+			continue
+		}
+		return part
+	}
+	return ""
+}
+
+func ownerPropertySegments(fullReceiver string) []string {
+	parts := strings.Split(fullReceiver, ".")
+	rootSeen := false
+	segments := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" || part == "this" {
+			continue
+		}
+		if !rootSeen {
+			rootSeen = true
+			continue
+		}
+		segments = append(segments, part)
+	}
+	return segments
+}
+
+func containsNormalized(items []string, value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	for _, item := range items {
+		if value == strings.ToLower(strings.TrimSpace(item)) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasObviousInfraSegment(fullReceiver string) bool {
+	for _, seg := range strings.Split(fullReceiver, ".") {
+		seg = strings.ToLower(strings.TrimSpace(seg))
+		if _, ok := obviousInfraSegments[seg]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func isPromptSafetyInfraCall(callee, funcName string) bool {
+	if _, ok := promptSafetyInfraMethods[strings.TrimSpace(funcName)]; ok {
+		return true
+	}
+	for _, prefix := range []string{"console.", "JSON.", "Math.", "Object.", "Array.", "Promise.", "expect.", "assert."} {
+		if strings.HasPrefix(callee, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractNewInstanceClass(value string) string {
+	if m := tsNewInstanceRe.FindStringSubmatch(value); len(m) == 2 {
+		return m[1]
+	}
+	return ""
+}
+
+func extractImportSymbols(imp types.ImportInfo) []string {
+	seen := make(map[string]struct{})
+	var symbols []string
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		name = strings.TrimPrefix(name, "type ")
+		if name == "" {
+			return
+		}
+		if idx := strings.Index(name, " as "); idx >= 0 {
+			name = strings.TrimSpace(name[idx+4:])
+		}
+		if _, ok := seen[name]; ok {
+			return
+		}
+		seen[name] = struct{}{}
+		symbols = append(symbols, name)
+	}
+
+	for _, candidate := range []string{imp.Alias, imp.Name} {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if start := strings.Index(candidate, "{"); start >= 0 {
+			end := strings.Index(candidate, "}")
+			if end > start {
+				for _, part := range strings.Split(candidate[start+1:end], ",") {
+					add(part)
+				}
+				candidate = strings.TrimSpace(candidate[:start])
+			}
+		}
+		for _, part := range strings.Split(candidate, ",") {
+			part = strings.TrimSpace(part)
+			if strings.HasPrefix(part, "* as ") {
+				part = strings.TrimSpace(strings.TrimPrefix(part, "* as "))
+			}
+			add(part)
+		}
+	}
+
+	return symbols
+}
+
+func matchesAnyPattern(value string, patterns []string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	for _, pattern := range patterns {
+		pattern = strings.TrimSpace(pattern)
+		if pattern == "" {
+			continue
+		}
+		matched, err := regexp.MatchString(pattern, value)
+		if err == nil && matched {
+			return true
+		}
+	}
+	return false
+}
+
+func isLocalImportPath(importPath string) bool {
+	return strings.HasPrefix(importPath, ".")
+}
+
+func resolveLocalImportFile(baseFile, importPath string) string {
+	baseDir := filepath.Dir(baseFile)
+	resolvedBase := filepath.Clean(filepath.Join(baseDir, importPath))
+	for _, candidate := range buildImportCandidates(resolvedBase) {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func buildImportCandidates(base string) []string {
+	if ext := filepath.Ext(base); ext != "" {
+		return []string{base}
+	}
+	var candidates []string
+	exts := []string{".ts", ".tsx", ".js", ".jsx", ".mts", ".cts"}
+	for _, ext := range exts {
+		candidates = append(candidates, base+ext)
+	}
+	for _, ext := range exts {
+		candidates = append(candidates, filepath.Join(base, "index"+ext))
+	}
+	return candidates
 }
 
 func extractTSCallArguments(line string, openParenIdx int) ([]string, int) {

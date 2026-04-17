@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/sandaogouchen/nep2midsence/internal/config"
+	"github.com/sandaogouchen/nep2midsence/internal/types"
 )
 
 func TestMatchesPatternFallsBackToExtensionsWhenFilePatternsEmpty(t *testing.T) {
@@ -134,4 +135,212 @@ func TestExtractDefaultPrompts(t *testing.T) {
 	if ps[0].PromptValue != "[goal] 文案下方的下拉icon" {
 		t.Fatalf("PromptValue = %q", ps[0].PromptValue)
 	}
+}
+
+func TestAnalyzeFileClassifiesBusinessAndInfrastructureOwners(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.WrapperFilter.ForceInfraCallPatterns = []string{`.*\.editAdSubmitBtn\.click$`}
+	engine := NewEngine(cfg)
+
+	dir := t.TempDir()
+	pageObjectPath := filepath.Join(dir, "ListPage.ts")
+	casePath := filepath.Join(dir, "sample.spec.ts")
+
+	pageObjectSource := `export default class ListPage {
+  commonActions = {}
+  editAdSubmitBtn = {}
+}
+`
+	caseSource := `import ListPage from "./ListPage"
+
+const listPage = new ListPage()
+
+test("owner classification", async ({ page }) => {
+  await page.sessionStorage.set("k", "v")
+  await listPage.commonActions.editCampaign2("campaignName", "campaignId")
+  await listPage.editAdSubmitBtn.click()
+  console.log("debug")
+})
+`
+	if err := os.WriteFile(pageObjectPath, []byte(pageObjectSource), 0o644); err != nil {
+		t.Fatalf("write page object: %v", err)
+	}
+	if err := os.WriteFile(casePath, []byte(caseSource), 0o644); err != nil {
+		t.Fatalf("write case file: %v", err)
+	}
+
+	result, err := engine.AnalyzeFile(casePath)
+	if err != nil {
+		t.Fatalf("AnalyzeFile returned error: %v", err)
+	}
+
+	steps := flattenCallSteps(result)
+	assertStep := func(fragment string) types.CallStep {
+		t.Helper()
+		for _, st := range steps {
+			if strings.Contains(st.Callee, fragment) {
+				return st
+			}
+		}
+		t.Fatalf("did not find step containing %q", fragment)
+		return types.CallStep{}
+	}
+
+	pageStorage := assertStep("page.sessionStorage.set")
+	if pageStorage.OwnerKind != "infrastructure" {
+		t.Fatalf("page.sessionStorage.set OwnerKind = %q, want infrastructure", pageStorage.OwnerKind)
+	}
+	if pageStorage.IsWrapperCall {
+		t.Fatalf("page.sessionStorage.set IsWrapperCall = true, want false")
+	}
+
+	businessWrapper := assertStep("listPage.commonActions.editCampaign2")
+	if businessWrapper.OwnerKind != "business" {
+		t.Fatalf("listPage.commonActions.editCampaign2 OwnerKind = %q, want business", businessWrapper.OwnerKind)
+	}
+	if !businessWrapper.IsWrapperCall {
+		t.Fatalf("listPage.commonActions.editCampaign2 IsWrapperCall = false, want true")
+	}
+	if businessWrapper.OwnerRoot != "listPage" {
+		t.Fatalf("listPage.commonActions.editCampaign2 OwnerRoot = %q, want listPage", businessWrapper.OwnerRoot)
+	}
+	if businessWrapper.OwnerFile != pageObjectPath {
+		t.Fatalf("listPage.commonActions.editCampaign2 OwnerFile = %q, want %q", businessWrapper.OwnerFile, pageObjectPath)
+	}
+
+	elementClick := assertStep("listPage.editAdSubmitBtn.click")
+	if elementClick.OwnerKind != "infrastructure" {
+		t.Fatalf("listPage.editAdSubmitBtn.click OwnerKind = %q, want infrastructure", elementClick.OwnerKind)
+	}
+	if elementClick.IsWrapperCall {
+		t.Fatalf("listPage.editAdSubmitBtn.click IsWrapperCall = true, want false")
+	}
+
+	consoleLog := assertStep("console.log")
+	if consoleLog.OwnerKind != "infrastructure" {
+		t.Fatalf("console.log OwnerKind = %q, want infrastructure", consoleLog.OwnerKind)
+	}
+	if consoleLog.IsWrapperCall {
+		t.Fatalf("console.log IsWrapperCall = true, want false")
+	}
+}
+
+func TestAnalyzeFileClassifiesForceInfraMethodWithoutReceiver(t *testing.T) {
+	cfg := config.DefaultConfig()
+	engine := NewEngine(cfg)
+
+	dir := t.TempDir()
+	casePath := filepath.Join(dir, "sample.spec.ts")
+	caseSource := `test("force infra method", async () => {
+  await waitForPageLoadStable()
+})
+`
+	if err := os.WriteFile(casePath, []byte(caseSource), 0o644); err != nil {
+		t.Fatalf("write case file: %v", err)
+	}
+
+	result, err := engine.AnalyzeFile(casePath)
+	if err != nil {
+		t.Fatalf("AnalyzeFile returned error: %v", err)
+	}
+
+	step := types.CallStep{}
+	found := false
+	for _, candidate := range flattenCallSteps(result) {
+		if candidate.Callee == "waitForPageLoadStable" {
+			step = candidate
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("did not find waitForPageLoadStable in extracted steps")
+	}
+	if step.OwnerKind != "infrastructure" {
+		t.Fatalf("OwnerKind = %q, want infrastructure", step.OwnerKind)
+	}
+	if step.OwnerSource != "config_force_infra_method" {
+		t.Fatalf("OwnerSource = %q, want config_force_infra_method", step.OwnerSource)
+	}
+	if step.OwnerRoot != "" {
+		t.Fatalf("OwnerRoot = %q, want empty", step.OwnerRoot)
+	}
+	if step.IsWrapperCall {
+		t.Fatalf("IsWrapperCall = true, want false")
+	}
+}
+
+func TestAnalyzeFileClassifiesBusinessWrappersInsideCommonIt(t *testing.T) {
+	cfg := config.DefaultConfig()
+	if !matchesAnyPattern("campaignPage", cfg.WrapperFilter.KnownBusinessNamePatterns) {
+		t.Fatalf("campaignPage should match business patterns: %#v", cfg.WrapperFilter.KnownBusinessNamePatterns)
+	}
+	engine := NewEngine(cfg)
+
+	dir := t.TempDir()
+	casePath := filepath.Join(dir, "sample.spec.ts")
+	caseSource := `import { commonIt } from "@utils/nep_utils/CommonIt/CommonIt"
+
+	describe('vv_cbo_afterview', () => {
+	  const caseName = 'vv_cbo_afterview'
+	  it(
+	    caseName,
+	    { timeout: 60 * 1000 },
+	    commonIt('mock-url', async ({ page, campaignPage, adGroupPage }) => {
+	      const campaignName = caseName + Date.now();
+	      await campaignPage.campaignNameModule.setCampaignName(campaignName);
+	      await campaignPage.campaignBudgetRadio.click();
+	      await campaignPage.campaignNameModule1MN.setCBOBudgetStrategy(BudgetMode.Daily, '20');
+	      await campaignPage.continueBtn.click();
+	      const adGroupName = 'Ad group' + Date.now();
+	      await adGroupPage.adGroupNameInput.type(adGroupName);
+	      await adGroupPage.optimizationAndBiddingModule1MNBA.vv_setAfterViewBtn();
+	      await adGroupPage.continueBtn.click();
+	    }),
+	  );
+	})
+	`
+	if err := os.WriteFile(casePath, []byte(caseSource), 0o644); err != nil {
+		t.Fatalf("write ts file: %v", err)
+	}
+
+	result, err := engine.AnalyzeFile(casePath)
+	if err != nil {
+		t.Fatalf("AnalyzeFile returned error: %v", err)
+	}
+
+	steps := flattenCallSteps(result)
+	assertWrapper := func(callee string) {
+		t.Helper()
+		for _, st := range steps {
+			if st.Callee == callee {
+				if st.OwnerKind != "business" {
+					t.Fatalf("%s OwnerKind = %q, want business (ownerRoot=%q ownerSource=%q fullReceiver=%q)", callee, st.OwnerKind, st.OwnerRoot, st.OwnerSource, st.FullReceiver)
+				}
+				if !st.IsWrapperCall {
+					t.Fatalf("%s IsWrapperCall = false, want true", callee)
+				}
+				return
+			}
+		}
+		for _, st := range steps {
+			t.Logf("step callee=%s ownerKind=%s wrapper=%v line=%d", st.Callee, st.OwnerKind, st.IsWrapperCall, st.Line)
+		}
+		t.Fatalf("did not find step %q", callee)
+	}
+
+	assertWrapper("campaignPage.campaignNameModule.setCampaignName")
+	assertWrapper("campaignPage.campaignNameModule1MN.setCBOBudgetStrategy")
+	assertWrapper("adGroupPage.optimizationAndBiddingModule1MNBA.vv_setAfterViewBtn")
+}
+
+func flattenCallSteps(result *types.FullAnalysis) []types.CallStep {
+	var steps []types.CallStep
+	if result == nil {
+		return steps
+	}
+	for _, chain := range result.CallChains {
+		steps = append(steps, chain.Steps...)
+	}
+	return steps
 }

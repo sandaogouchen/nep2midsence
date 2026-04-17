@@ -14,3 +14,4 @@ casemover
 # OS
 .DS_Store
 Thumbs.db
+scripts/node_modules

@@ -223,11 +223,11 @@ func (e *Engine) extractTypeScript(filePath string) (*types.ASTInfo, []types.Cal
 		results, err := e.tsBridge.Extract([]string{filePath})
 		if err == nil && len(results) > 0 {
 			astInfo := e.tsBridge.ConvertToASTInfo(results[0])
-			return astInfo, e.tsBridge.ConvertAllCalls(results[0]), tsLanguageForPath(filePath), nil
+			return astInfo, e.tsBridge.ConvertAllCalls(results[0], astInfo, e.cfg), tsLanguageForPath(filePath), nil
 		}
 	}
 
-	return extractTypeScriptFallback(filePath)
+	return extractTypeScriptFallback(filePath, e.cfg)
 }
 
 func newTSBridgeFromConfig(cfg *config.Config) *TSBridge {

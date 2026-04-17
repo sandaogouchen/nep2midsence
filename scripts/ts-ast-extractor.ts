@@ -12,7 +12,7 @@ const NEP_API_MAP: Record<string, string> = {
   findElements: "findElements", querySelectorAll: "findElements",
   waitForElement: "waitFor", waitForSelector: "waitFor",
   waitForNavigation: "waitFor", waitForTimeout: "waitFor",
-  assertVisible: "assert", assertText: "assert", assertExists: "assert", expect: "assert",
+  assertVisible: "assert", assertText: "assert", assertExists: "assert",
   getText: "extract", getInnerText: "extract", getAttribute: "extract",
   create: "lifecycle", close: "lifecycle",
   login: "composite",
@@ -20,6 +20,10 @@ const NEP_API_MAP: Record<string, string> = {
 
 const TEST_HOOKS = new Set(["beforeEach", "afterEach", "beforeAll", "afterAll"]);
 const TEST_BLOCKS = new Set(["describe", "it", "test"]);
+const DEFAULT_INFRA_ROOTS = new Set(["page", "browser", "context", "console", "json", "math", "promise", "process", "window", "document"]);
+const BUSINESS_ROOT_PATTERNS = [/(?:Page|Actions|Module|Helper)$/i];
+const ELEMENT_LIKE_PROPERTY_PATTERNS = [/(?:Btn|Button|Input|Select|Locator|Element)$/i];
+const INFRA_TERMINAL_METHODS = new Set(["click", "dblclick", "hover", "focus", "blur", "check", "uncheck", "fill", "type", "press", "locator", "nth", "first", "last"]);
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 interface ImportInfo {
@@ -76,6 +80,10 @@ interface CallInfo {
   receiver?: string;
   fullReceiver?: string;
   funcName?: string;
+  ownerRoot?: string;
+  ownerKind?: string;
+  ownerSource?: string;
+  ownerFile?: string;
   line?: number;
   isNep?: boolean;
   isChained?: boolean;
@@ -162,6 +170,48 @@ function terminalMethodName(callee: string): string {
   return parts[parts.length - 1];
 }
 
+function extractOwnerRoot(fullReceiver: string): string {
+  const parts = fullReceiver.split(".").map((part) => part.trim()).filter(Boolean);
+  for (const part of parts) {
+    if (part === "this") continue;
+    return part;
+  }
+  return "";
+}
+
+function ownerPropertySegments(fullReceiver: string): string[] {
+  const parts = fullReceiver.split(".").map((part) => part.trim()).filter((part) => part !== "" && part !== "this");
+  return parts.slice(1);
+}
+
+function classifyOwner(fullReceiver: string, funcName: string): { ownerRoot: string; ownerKind: string; ownerSource: string } {
+  const ownerRoot = extractOwnerRoot(fullReceiver);
+  if (!ownerRoot) {
+    if (["expect", "assert", "log", "info", "warn", "error", "debug", "stringify", "parse"].includes(funcName)) {
+      return { ownerRoot: "", ownerKind: "infrastructure", ownerSource: "safety_no_receiver" };
+    }
+    return { ownerRoot: "", ownerKind: "unknown", ownerSource: "no_owner_root" };
+  }
+
+  if (DEFAULT_INFRA_ROOTS.has(ownerRoot.toLowerCase())) {
+    return { ownerRoot, ownerKind: "infrastructure", ownerSource: "known_infra_root" };
+  }
+
+  if (INFRA_TERMINAL_METHODS.has(funcName)) {
+    for (const seg of ownerPropertySegments(fullReceiver)) {
+      if (ELEMENT_LIKE_PROPERTY_PATTERNS.some((pattern) => pattern.test(seg))) {
+        return { ownerRoot, ownerKind: "infrastructure", ownerSource: "element_like_property" };
+      }
+    }
+  }
+
+  if (BUSINESS_ROOT_PATTERNS.some((pattern) => pattern.test(ownerRoot))) {
+    return { ownerRoot, ownerKind: "business", ownerSource: "business_name_pattern" };
+  }
+
+  return { ownerRoot, ownerKind: "unknown", ownerSource: "fallback_unknown" };
+}
+
 function resolveNep(callee: string): { isNepAPI: boolean; nepAPIType: string } {
   const method = terminalMethodName(callee);
   const cat = NEP_API_MAP[method];
@@ -236,6 +286,7 @@ function collectCalls(node: ts.Node, src: ts.SourceFile, sourceText: string): Ca
       const receiver = parts.length > 1 ? parts[parts.length - 2] : "";
       const isChained = parts.length > 1;
       const isWrapperCall = parts.length > 2;
+      const owner = classifyOwner(fullReceiver, funcName);
 
       const startLine = lineOf(src, target.getStart());
       calls.push({
@@ -251,6 +302,10 @@ function collectCalls(node: ts.Node, src: ts.SourceFile, sourceText: string): Ca
         receiver,
         fullReceiver,
         funcName,
+        ownerRoot: owner.ownerRoot,
+        ownerKind: owner.ownerKind,
+        ownerSource: owner.ownerSource,
+        ownerFile: "",
         line: startLine,
         isNep: nep.isNepAPI,
         isChained,

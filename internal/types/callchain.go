@@ -6,7 +6,7 @@ type CallChain struct {
 	Steps       []CallStep `json:"steps"`
 	MaxDepth    int        `json:"max_depth"`
 	NepAPICalls []CallStep `json:"nep_api_calls"`
-	
+
 	// WrapperCalls contains non-NEP wrapper/module/component method calls that
 	// are relevant for migration (e.g., pageObject.module.vv_setStandardBtn()).
 	WrapperCalls []CallStep `json:"wrapper_calls,omitempty"`
@@ -35,6 +35,10 @@ type CallStep struct {
 	Receiver      string `json:"receiver,omitempty"`
 	FullReceiver  string `json:"full_receiver,omitempty"`
 	FuncName      string `json:"func_name,omitempty"`
+	OwnerRoot     string `json:"owner_root,omitempty"`
+	OwnerKind     string `json:"owner_kind,omitempty"`
+	OwnerSource   string `json:"owner_source,omitempty"`
+	OwnerFile     string `json:"owner_file,omitempty"`
 	IsNep         bool   `json:"is_nep,omitempty"`
 	IsAwait       bool   `json:"is_await,omitempty"`
 	IsChained     bool   `json:"is_chained,omitempty"`
