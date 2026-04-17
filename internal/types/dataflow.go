@@ -10,6 +10,7 @@ const (
 	ValueParam         ValueKind = "param"
 	ValueConcatenation ValueKind = "concatenation"
 	ValueUnresolved    ValueKind = "unresolved"
+	ValueUnknown       ValueKind = "unknown" // TS-specific, used by layer3_dataflow_v2.go
 )
 
 type ValueInfo struct {
@@ -20,6 +21,10 @@ type ValueInfo struct {
 	UsedBy     []Usage     `json:"used_by"`
 	Components []ValueInfo `json:"components,omitempty"`
 	Variable   string      `json:"variable"`
+
+	// TS-specific fields used by layer3_dataflow_v2.go
+	ArgIndex int `json:"arg_index,omitempty"`
+	StepLine int `json:"step_line,omitempty"`
 }
 
 type Location struct {
