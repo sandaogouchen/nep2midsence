@@ -52,6 +52,12 @@ type SourceConfig struct {
 type TargetConfig struct {
 	OutputDir  string `json:"output_dir" yaml:"output_dir"`
 	FileSuffix string `json:"file_suffix" yaml:"file_suffix"`
+	BaseDir    string `json:"base_dir" yaml:"base_dir"` // Cross-repo target root; empty = same-repo mode
+}
+
+// IsCrossRepo reports whether cross-repo migration mode is active.
+func (c *Config) IsCrossRepo() bool {
+	return strings.TrimSpace(c.Target.BaseDir) != ""
 }
 
 type AnalysisConfig struct {

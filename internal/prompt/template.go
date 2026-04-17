@@ -14,6 +14,18 @@ const migrationTemplate = `## 迁移任务
 （无额外迁移文档）
 {{end}}
 
+{{if .IsCrossRepo}}
+---
+
+### 跨仓库迁移说明
+
+本次为跨仓库迁移：
+- 源仓库：` + "`" + `{{.SourceRepoRoot}}` + "`" + `
+- 目标仓库：` + "`" + `{{.TargetRepoRoot}}` + "`" + `
+
+请 Read 源文件后将迁移代码写入目标路径。输出文件中不得残留任何 NEP import 或调用。
+{{end}}
+
 ---
 
 ### 2. 本 Case 涉及的 API 映射表

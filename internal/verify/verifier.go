@@ -2,6 +2,8 @@ package verify
 
 import (
 	"bytes"
+	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -32,6 +34,9 @@ func NewVerifier(projectDir, buildCmd, testCmd string) *Verifier {
 // Verify checks a migrated file for compilation and optionally runs tests
 func (v *Verifier) Verify(result *types.MigrationResult) *types.VerifyResult {
 	vr := &types.VerifyResult{CaseFile: result.CaseFile}
+
+	// 0. NEP residual check (cross-repo: migrated files must not contain NEP markers)
+	vr.NepCleanOK, vr.NepCleanError = checkNepClean(result.TargetFile)
 
 	// 1. Compile check
 	vr.CompileOK, vr.CompileError = v.checkCompile(result.TargetFile)
@@ -117,4 +122,42 @@ func (v *Verifier) generateDiff(sourceFile, targetFile string) string {
 	cmd.Stdout = &stdout
 	cmd.Run() // diff returns non-zero when files differ, that's ok
 	return stdout.String()
+}
+
+// nepResidualMarkers are strings that indicate NEP framework usage.
+var nepResidualMarkers = []string{
+	"ai.action(",
+	"ai?.action(",
+	"ai.getElement(",
+	"ai?.getElement(",
+	"clickElementByVL(",
+	"from 'nep",
+	`from "nep`,
+	"require('nep",
+	`require("nep`,
+	"nep_utils",
+	"AiAgent",
+}
+
+// checkNepClean scans a target file for residual NEP markers.
+func checkNepClean(targetFile string) (bool, string) {
+	if targetFile == "" {
+		return true, ""
+	}
+	content, err := os.ReadFile(targetFile)
+	if err != nil {
+		// File doesn't exist yet (migration may have failed); skip check.
+		return true, ""
+	}
+	text := string(content)
+	var found []string
+	for _, marker := range nepResidualMarkers {
+		if strings.Contains(text, marker) {
+			found = append(found, marker)
+		}
+	}
+	if len(found) == 0 {
+		return true, ""
+	}
+	return false, fmt.Sprintf("NEP residual markers found: %s", strings.Join(found, ", "))
 }

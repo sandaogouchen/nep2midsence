@@ -22,6 +22,7 @@ type Engine struct {
 	intentAnalyzer    *IntentAnalyzer
 	annotator         *fingerprint.Annotator
 	tsBridge          *TSBridge
+	sourceRepoRoot    string // detected source repository root (for cross-repo mode)
 }
 
 func NewEngine(cfg *config.Config) *Engine {
@@ -145,16 +146,34 @@ func (e *Engine) analyzeTypeScriptFile(filePath string, result *types.FullAnalys
 
 // AnalyzeDir analyzes all matching files in a directory
 func (e *Engine) AnalyzeDir(dir string) ([]*types.FullAnalysis, error) {
+	// In cross-repo mode, auto-detect source repo root if not set.
+	if e.cfg.IsCrossRepo() && e.sourceRepoRoot == "" {
+		e.sourceRepoRoot = DetectSourceRepoRoot(dir)
+	}
+
 	var results []*types.FullAnalysis
+
+	// Resolve target base dir for skip check in cross-repo mode.
+	targetBaseAbs := ""
+	if e.cfg.IsCrossRepo() {
+		targetBaseAbs, _ = filepath.Abs(e.cfg.Target.BaseDir)
+	}
 
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if info.IsDir() {
-			// Skip output directory
+			// Skip output directory (same-repo mode)
 			if info.Name() == e.cfg.Target.OutputDir {
 				return filepath.SkipDir
+			}
+			// Skip target base directory if it's inside the source tree (cross-repo guard)
+			if targetBaseAbs != "" {
+				absPath, _ := filepath.Abs(path)
+				if absPath == targetBaseAbs {
+					return filepath.SkipDir
+				}
 			}
 			return nil
 		}
@@ -205,6 +224,21 @@ func (e *Engine) matchesPattern(name string) bool {
 }
 
 func (e *Engine) computeTargetPath(sourcePath string) string {
+	// Cross-repo mode: preserve relative path from source repo root into target base dir.
+	if e.cfg.IsCrossRepo() {
+		root := e.sourceRepoRoot
+		if root == "" {
+			root = filepath.Dir(sourcePath)
+		}
+		relPath, err := filepath.Rel(root, sourcePath)
+		if err != nil || strings.HasPrefix(relPath, "..") {
+			// Fallback: keep file name only
+			relPath = filepath.Base(sourcePath)
+		}
+		return filepath.Join(e.cfg.Target.BaseDir, relPath)
+	}
+
+	// Same-repo mode (original behavior)
 	dir := filepath.Dir(sourcePath)
 	base := filepath.Base(sourcePath)
 	targetDir := filepath.Join(dir, e.cfg.Target.OutputDir)
@@ -216,6 +250,50 @@ func (e *Engine) computeTargetPath(sourcePath string) string {
 	}
 
 	return filepath.Join(targetDir, base)
+}
+
+// SetSourceRepoRoot explicitly sets the source repository root directory.
+func (e *Engine) SetSourceRepoRoot(root string) {
+	e.sourceRepoRoot = root
+}
+
+// SourceRepoRoot returns the detected or set source repo root.
+func (e *Engine) SourceRepoRoot() string {
+	return e.sourceRepoRoot
+}
+
+// DetectSourceRepoRoot walks up from dir looking for .git or e2e/ directory
+// to determine the source repository root.
+func DetectSourceRepoRoot(dir string) string {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return dir
+	}
+	cur := abs
+	for {
+		// Check for .git directory
+		if info, err := os.Stat(filepath.Join(cur, ".git")); err == nil && info.IsDir() {
+			return cur
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+	// Fallback: look for e2e/ as a heuristic
+	cur = abs
+	for {
+		if info, err := os.Stat(filepath.Join(cur, "e2e")); err == nil && info.IsDir() {
+			return cur
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+	return abs
 }
 
 func (e *Engine) extractTypeScript(filePath string) (*types.ASTInfo, []types.CallStep, string, error) {

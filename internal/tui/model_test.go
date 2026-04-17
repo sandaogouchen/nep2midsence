@@ -189,10 +189,18 @@ func TestDirectoryPickerKeepsListNavigationAfterSearch(t *testing.T) {
 	next, cmd := updated.Update(tea.KeyMsg{Type: tea.KeyDown})
 	updated = next.(Model)
 
+	// Enter selects the source directory; for modeStart this transitions to target picker.
 	next, cmd = updated.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	updated = next.(Model)
+	if updated.activeView != viewTargetDirectory {
+		t.Fatalf("activeView = %q, want %q", updated.activeView, viewTargetDirectory)
+	}
+
+	// Tab confirms the target directory and triggers the workflow.
+	next, cmd = updated.Update(tea.KeyMsg{Type: tea.KeyTab})
+	updated = next.(Model)
 	if cmd == nil {
-		t.Fatal("enter after search returned nil tea.Cmd")
+		t.Fatal("tab in target picker returned nil tea.Cmd")
 	}
 
 	for i := 0; i < 3 && cmd != nil; i++ {
@@ -326,13 +334,17 @@ func (r *countingRuntime) ListDirectories(root string) ([]string, error) {
 	return []string{root}, nil
 }
 
+func (r *countingRuntime) ListImmediateDirectories(path string) ([]string, error) {
+	return nil, nil
+}
+
 func (r *countingRuntime) RunAnalyze(ctx context.Context, dir string, notify func(WorkflowEvent)) (*WorkflowResult, error) {
 	r.analyzeCalls++
 	notify(WorkflowEvent{Stage: "analyze", Message: "counting analyze"})
 	return &WorkflowResult{Mode: "analyze", Dir: dir}, nil
 }
 
-func (r *countingRuntime) RunStart(ctx context.Context, dir string, notify func(WorkflowEvent)) (*WorkflowResult, error) {
+func (r *countingRuntime) RunStart(ctx context.Context, dir string, targetBaseDir string, notify func(WorkflowEvent)) (*WorkflowResult, error) {
 	r.startCalls++
 	notify(WorkflowEvent{Stage: "start", Message: "counting start"})
 	return &WorkflowResult{Mode: "start", Dir: dir}, nil

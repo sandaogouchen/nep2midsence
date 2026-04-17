@@ -48,8 +48,9 @@ type WorkflowResult struct {
 // Runtime is the execution surface the TUI needs.
 type Runtime interface {
 	ListDirectories(root string) ([]string, error)
+	ListImmediateDirectories(path string) ([]string, error)
 	RunAnalyze(ctx context.Context, dir string, notify func(WorkflowEvent)) (*WorkflowResult, error)
-	RunStart(ctx context.Context, dir string, notify func(WorkflowEvent)) (*WorkflowResult, error)
+	RunStart(ctx context.Context, dir string, targetBaseDir string, notify func(WorkflowEvent)) (*WorkflowResult, error)
 	LoadState(dir string) (executor.StateSnapshot, error)
 }
 
@@ -93,6 +94,29 @@ func (r *AppRuntime) ListDirectories(root string) ([]string, error) {
 	return dirs, nil
 }
 
+// ListImmediateDirectories returns one level of child directories for the
+// given path, suitable for breadcrumb-style directory browsing in cross-repo
+// target selection. It skips .git, node_modules, and dist directories.
+func (r *AppRuntime) ListImmediateDirectories(path string) ([]string, error) {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil, err
+	}
+	var dirs []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if name == ".git" || name == "node_modules" || name == "dist" {
+			continue
+		}
+		dirs = append(dirs, filepath.Join(path, name))
+	}
+	sort.Strings(dirs)
+	return dirs, nil
+}
+
 func (r *AppRuntime) RunAnalyze(ctx context.Context, dir string, notify func(WorkflowEvent)) (*WorkflowResult, error) {
 	notify(WorkflowEvent{Stage: "analyze", Message: "正在分析目录", CurrentFile: dir})
 	engine := analyzer.NewEngine(r.cfg)
@@ -109,7 +133,7 @@ func (r *AppRuntime) RunAnalyze(ctx context.Context, dir string, notify func(Wor
 	}, nil
 }
 
-func (r *AppRuntime) RunStart(ctx context.Context, dir string, notify func(WorkflowEvent)) (*WorkflowResult, error) {
+func (r *AppRuntime) RunStart(ctx context.Context, dir string, targetBaseDir string, notify func(WorkflowEvent)) (*WorkflowResult, error) {
 	tool := executor.NormalizeToolForConfig(r.cfg.Execution.Tool)
 	if tool == "" {
 		tool = executor.ToolCoco
@@ -120,6 +144,14 @@ func (r *AppRuntime) RunStart(ctx context.Context, dir string, notify func(Workf
 	}
 
 	engine := analyzer.NewEngine(r.cfg)
+
+	// Cross-repo mode: set target base dir in config and detect source repo root.
+	if strings.TrimSpace(targetBaseDir) != "" {
+		r.cfg.Target.BaseDir = targetBaseDir
+		sourceRoot := analyzer.DetectSourceRepoRoot(dir)
+		engine.SetSourceRepoRoot(sourceRoot)
+	}
+
 	notify(WorkflowEvent{Stage: "analyze", Message: "分析目录结构"})
 	analyses, err := engine.AnalyzeDir(dir)
 	if err != nil {
@@ -140,21 +172,31 @@ func (r *AppRuntime) RunStart(ctx context.Context, dir string, notify func(Workf
 
 	runID := fmt.Sprintf("run-%d", time.Now().UnixNano())
 	startedAt := time.Now()
-	if err := store.StartRun(runID, dir, plan.TotalPlanned, startedAt); err != nil {
+	if err := store.StartRun(runID, dir, targetBaseDir, plan.TotalPlanned, startedAt); err != nil {
 		return nil, err
 	}
 
 	notify(WorkflowEvent{Stage: "generate", Message: fmt.Sprintf("生成迁移计划，共 %d 个任务（含封装/helper）", plan.TotalPlanned), Total: plan.TotalPlanned})
 	gen := prompt.NewGenerator(r.cfg)
 
+	// Determine executor work directory: use targetBaseDir for cross-repo mode.
+	execWorkDir := dir
+	if strings.TrimSpace(targetBaseDir) != "" {
+		execWorkDir = targetBaseDir
+		// Ensure target base directory exists.
+		if err := os.MkdirAll(targetBaseDir, 0o755); err != nil {
+			return nil, fmt.Errorf("create target base dir: %w", err)
+		}
+	}
+
 	var promptExec executor.PromptExecutor
 	switch tool {
 	case executor.ToolCC:
-		promptExec = executor.NewCCExecutor(dir, 0)
+		promptExec = executor.NewCCExecutor(execWorkDir, 0)
 	case executor.ToolCodex:
-		promptExec = executor.NewCodexExecutor(dir, 0)
+		promptExec = executor.NewCodexExecutor(execWorkDir, 0)
 	default:
-		promptExec = executor.NewCocoExecutor(dir, 0)
+		promptExec = executor.NewCocoExecutor(execWorkDir, 0)
 	}
 
 	scheduler := executor.NewScheduler(promptExec, gen, r.cfg.Execution.MaxJobs, r.cfg.Execution.RetryLimit)
@@ -237,7 +279,11 @@ func (r *AppRuntime) RunStart(ctx context.Context, dir string, notify func(Workf
 	}
 
 	notify(WorkflowEvent{Stage: "verify", Message: "验证迁移结果"})
-	verifier := verify.NewVerifier(dir, "", "")
+	verifyDir := dir
+	if strings.TrimSpace(targetBaseDir) != "" {
+		verifyDir = targetBaseDir
+	}
+	verifier := verify.NewVerifier(verifyDir, "", "")
 	verifyResults := verifier.VerifyAll(results)
 
 	reporter := verify.NewReporter()
@@ -1123,12 +1169,16 @@ func (r *NoopRuntime) ListDirectories(root string) ([]string, error) {
 	return []string{root}, nil
 }
 
+func (r *NoopRuntime) ListImmediateDirectories(path string) ([]string, error) {
+	return nil, nil
+}
+
 func (r *NoopRuntime) RunAnalyze(ctx context.Context, dir string, notify func(WorkflowEvent)) (*WorkflowResult, error) {
 	notify(WorkflowEvent{Stage: "analyze", Message: "noop analyze", Total: 0})
 	return &WorkflowResult{Mode: "analyze", Dir: dir}, nil
 }
 
-func (r *NoopRuntime) RunStart(ctx context.Context, dir string, notify func(WorkflowEvent)) (*WorkflowResult, error) {
+func (r *NoopRuntime) RunStart(ctx context.Context, dir string, targetBaseDir string, notify func(WorkflowEvent)) (*WorkflowResult, error) {
 	notify(WorkflowEvent{Stage: "complete", Message: "noop start", Total: 0})
 	return &WorkflowResult{Mode: "start", Dir: dir}, nil
 }
