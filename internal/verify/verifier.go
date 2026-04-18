@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/sandaogouchen/nep2midsence/internal/types"
@@ -82,7 +84,7 @@ func (v *Verifier) checkCompile(targetFile string) (bool, string) {
 		return false, "empty build command"
 	}
 
-	args := append(parts[1:], "./...")
+	args := buildCompileArgs(parts)
 	cmd := exec.Command(parts[0], args...)
 	cmd.Dir = v.projectDir
 
@@ -90,7 +92,11 @@ func (v *Verifier) checkCompile(targetFile string) (bool, string) {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return false, stderr.String()
+		output := stderr.String()
+		if strings.TrimSpace(output) == "" {
+			output = err.Error()
+		}
+		return false, summarizeTypeScriptCompileErrors(output)
 	}
 	return true, ""
 }
@@ -161,4 +167,78 @@ func CheckNepClean(targetFile string) (bool, string) {
 		return true, ""
 	}
 	return false, fmt.Sprintf("NEP residual markers found: %s", strings.Join(found, ", "))
+}
+
+func buildCompileArgs(parts []string) []string {
+	if len(parts) <= 1 {
+		return nil
+	}
+	cmdName := filepathBase(parts[0])
+	if cmdName == "go" && len(parts) > 1 && parts[1] == "build" {
+		return append(parts[1:], "./...")
+	}
+	return parts[1:]
+}
+
+var tsMissingModuleRe = regexp.MustCompile(`TS2307: Cannot find module ['"]([^'"]+)['"]`)
+
+func summarizeTypeScriptCompileErrors(output string) string {
+	matches := tsMissingModuleRe.FindAllStringSubmatch(output, -1)
+	if len(matches) == 0 {
+		return output
+	}
+
+	seen := make(map[string]struct{})
+	var modules []string
+	for _, match := range matches {
+		if len(match) < 2 {
+			continue
+		}
+		moduleName := strings.TrimSpace(match[1])
+		if moduleName == "" {
+			continue
+		}
+		if _, ok := seen[moduleName]; ok {
+			continue
+		}
+		seen[moduleName] = struct{}{}
+		modules = append(modules, moduleName)
+	}
+	sort.Strings(modules)
+
+	lines := []string{
+		fmt.Sprintf("TypeScript compile failed: missing modules (%d)", len(modules)),
+		strings.Join(modules, ", "),
+	}
+	for _, moduleName := range modules {
+		if suggestion := suggestReplacementForMissingModule(moduleName); suggestion != "" {
+			lines = append(lines, suggestion)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func suggestReplacementForMissingModule(moduleName string) string {
+	switch {
+	case strings.Contains(moduleName, "BaseComponent"):
+		return "Suggestion: replace BaseComponent references with MidComponent compatibility exports."
+	case strings.Contains(moduleName, "Radio"):
+		return "Suggestion: provide MidRadio compatibility exports for Radio-based components."
+	case strings.Contains(moduleName, "Input"):
+		return "Suggestion: provide MidInput compatibility exports for Input-based components."
+	case strings.Contains(moduleName, "Switch"):
+		return "Suggestion: provide MidSwitch compatibility exports for Switch-based components."
+	default:
+		return ""
+	}
+}
+
+func filepathBase(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	path = strings.ReplaceAll(path, "\\", "/")
+	parts := strings.Split(path, "/")
+	return parts[len(parts)-1]
 }

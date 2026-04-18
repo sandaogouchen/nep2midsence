@@ -28,6 +28,7 @@ var (
 	tsCallRe = regexp.MustCompile(`((?:[A-Za-z_$][\w$]*\.)+)?([A-Za-z_$][\w$]*)\s*\(`)
 	// component prompt extraction
 	tsClassDeclRe       = regexp.MustCompile(`\bclass\s+([A-Za-z_$][\w$]*)`)
+	classExtendsRe      = regexp.MustCompile(`\bclass\s+([A-Za-z_$][\w$]*)\s+extends\s+([A-Za-z_$][\w$]*)`)
 	tsDefaultPromptHint = "DEFAULT_PROMPT"
 )
 
@@ -210,8 +211,73 @@ func extractTypeScriptFallback(filePath string, cfg *config.Config) (*types.ASTI
 		}
 	}
 
+	if matches := classExtendsRe.FindStringSubmatch(source); len(matches) == 3 {
+		astInfo.ClassName = strings.TrimSpace(matches[1])
+		astInfo.ExtendsFrom = strings.TrimSpace(matches[2])
+		astInfo.ExtendsImport = findImportedSymbolPath(astInfo.Imports, astInfo.ExtendsFrom)
+	} else if matches := tsClassDeclRe.FindStringSubmatch(source); len(matches) == 2 {
+		astInfo.ClassName = strings.TrimSpace(matches[1])
+	}
+
 	allCalls := collectTSCalls(filePath, lines, astInfo, cfg, testRanges, hookRanges)
 	return astInfo, allCalls, language, nil
+}
+
+func findImportedSymbolPath(imports []types.ImportInfo, symbol string) string {
+	symbol = strings.TrimSpace(symbol)
+	if symbol == "" {
+		return ""
+	}
+	for _, imp := range imports {
+		if importSpecIncludesSymbol(imp.Name, symbol) {
+			return imp.Path
+		}
+	}
+	return ""
+}
+
+func importSpecIncludesSymbol(importSpec string, symbol string) bool {
+	importSpec = strings.TrimSpace(importSpec)
+	symbol = strings.TrimSpace(symbol)
+	if importSpec == "" || symbol == "" {
+		return false
+	}
+
+	if !strings.HasPrefix(importSpec, "{") {
+		fields := strings.Fields(importSpec)
+		if len(fields) > 0 && fields[0] == symbol {
+			return true
+		}
+		if strings.Contains(importSpec, ",") {
+			parts := strings.Split(importSpec, ",")
+			if len(parts) > 0 && strings.TrimSpace(parts[0]) == symbol {
+				return true
+			}
+		}
+	}
+
+	if strings.Contains(importSpec, "{") {
+		start := strings.Index(importSpec, "{")
+		end := strings.LastIndex(importSpec, "}")
+		if start >= 0 && end > start {
+			items := strings.Split(importSpec[start+1:end], ",")
+			for _, item := range items {
+				item = strings.TrimSpace(item)
+				if item == "" {
+					continue
+				}
+				parts := strings.Fields(item)
+				if len(parts) == 1 && parts[0] == symbol {
+					return true
+				}
+				if len(parts) >= 3 && (parts[0] == symbol || parts[len(parts)-1] == symbol) {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
 }
 
 type tsRange struct {

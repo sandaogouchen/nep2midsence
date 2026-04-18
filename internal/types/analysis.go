@@ -31,6 +31,9 @@ type ASTInfo struct {
 	Constants  []ConstInfo  `json:"constants"`
 	Variables  []VarInfo    `json:"variables"`
 	InitBlocks []InitInfo   `json:"init_blocks"`
+	ClassName  string       `json:"class_name,omitempty"`
+	ExtendsFrom string      `json:"extends_from,omitempty"`
+	ExtendsImport string    `json:"extends_import,omitempty"`
 }
 
 type ImportInfo struct {

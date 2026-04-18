@@ -165,7 +165,7 @@ func (r *AppRuntime) RunStart(ctx context.Context, dir string, targetBaseDir str
 	}
 
 	// Build execution plan: migrate shared helper/wrapper files first, then migrate cases.
-	plan, err := buildMigrationPlan(engine, analyses, store)
+	plan, err := buildMigrationPlan(r.cfg, engine, analyses, store)
 	if err != nil {
 		return nil, err
 	}
@@ -370,7 +370,7 @@ type migrationPlan struct {
 	MetaByFile      map[string]planItemMeta
 }
 
-func buildMigrationPlan(engine *analyzer.Engine, analyses []*types.FullAnalysis, store *executor.StateStore) (*migrationPlan, error) {
+func buildMigrationPlan(cfg *config.Config, engine *analyzer.Engine, analyses []*types.FullAnalysis, store *executor.StateStore) (*migrationPlan, error) {
 	// Partition: treat files with tests as cases.
 	var cases []*types.FullAnalysis
 	for _, a := range analyses {
@@ -379,25 +379,41 @@ func buildMigrationPlan(engine *analyzer.Engine, analyses []*types.FullAnalysis,
 		}
 	}
 
+	var tscp *config.TsConfigPaths
+	var inheritanceGraph *analyzer.InheritanceGraph
+	if tsconfigPath := findNearestTSConfigFromAnalyses(analyses); tsconfigPath != "" {
+		if loaded, err := config.LoadTsConfig(tsconfigPath); err == nil {
+			tscp = loaded
+			inheritanceGraph = analyzer.BuildInheritanceGraph(loaded.ProjectRoot, loaded)
+		}
+	}
+	if inheritanceGraph == nil && len(cases) > 0 {
+		inheritanceGraph = analyzer.BuildInheritanceGraph(findProjectRootForFile(cases[0].FilePath), tscp)
+	}
+
 	// Discover helper candidates from all cases.
 	helperPaths := make(map[string]struct{})
 	for _, ca := range cases {
-		deps := collectLocalImportDeps(ca)
+		deps := collectLocalImportDeps(ca, tscp)
 		funcNames := collectCandidateFuncNames(ca)
 		scanned := scanHelperCandidates(filepath.Dir(ca.FilePath), funcNames)
-		chainDeps := tracePropertyChainDeps(ca)
+		chainDeps := tracePropertyChainDeps(ca, tscp)
+		extended := scanExtendedDirectories(cfg, tscp, inheritanceGraph)
 
 		// Dependencies provide context; helper candidates may be migrated.
-		ca.Dependencies = uniqueStrings(append(append(deps, scanned...), chainDeps...))
+		ca.Dependencies = uniqueStrings(append(append(append(deps, scanned...), chainDeps...), extended...))
 		for _, p := range scanned {
 			helperPaths[p] = struct{}{}
 		}
 		for _, p := range chainDeps {
 			helperPaths[p] = struct{}{}
 		}
+		for _, p := range extended {
+			helperPaths[p] = struct{}{}
+		}
 		for _, p := range deps {
 			// If a local import is NEP-related, it should also be migrated.
-			if isNepRelatedFile(p) {
+			if isNepRelatedFile(p, inheritanceGraph) {
 				helperPaths[p] = struct{}{}
 			}
 		}
@@ -414,7 +430,7 @@ func buildMigrationPlan(engine *analyzer.Engine, analyses []*types.FullAnalysis,
 			continue
 		}
 		// Add its own local deps for context.
-		a.Dependencies = uniqueStrings(collectLocalImportDeps(a))
+		a.Dependencies = uniqueStrings(collectLocalImportDeps(a, tscp))
 		// Extract component DEFAULT_PROMPTs for later use in case prompt generation.
 		a.DefaultPrompts = analyzer.ExtractDefaultPrompts(a.FilePath)
 		if len(a.DefaultPrompts) > 0 {
@@ -535,16 +551,16 @@ func isCaseAnalysis(a *types.FullAnalysis) bool {
 	return false
 }
 
-func collectLocalImportDeps(a *types.FullAnalysis) []string {
+func collectLocalImportDeps(a *types.FullAnalysis, tscp *config.TsConfigPaths) []string {
 	if a == nil || a.AST == nil {
 		return nil
 	}
 	var deps []string
 	for _, imp := range a.AST.Imports {
-		if !strings.HasPrefix(imp.Path, ".") {
+		if !isLocalImportPath(imp.Path, tscp) {
 			continue
 		}
-		resolved := resolveLocalImportFile(a.FilePath, imp.Path)
+		resolved := resolveImportFile(a.FilePath, imp.Path, tscp)
 		if resolved == "" {
 			continue
 		}
@@ -655,7 +671,7 @@ func scanHelperCandidates(caseDir string, funcNames []string) []string {
 // The core goal is to find the PageObject/module files that define the
 // intermediate property (optimizationAndBiddingModule1MNBA) so they can be
 // migrated before the case.
-func tracePropertyChainDeps(ca *types.FullAnalysis) []string {
+func tracePropertyChainDeps(ca *types.FullAnalysis, tscp *config.TsConfigPaths) []string {
 	props := collectWrapperPropertyNames(ca)
 	if len(props) == 0 {
 		return nil
@@ -684,7 +700,7 @@ func tracePropertyChainDeps(ca *types.FullAnalysis) []string {
 		candidates := scanFilesForProperty(roots, prop)
 		for _, poFile := range candidates {
 			add(poFile, &discovered)
-			moduleFile := resolveModuleFileFromProperty(poFile, prop)
+			moduleFile := resolveModuleFileFromProperty(poFile, prop, tscp)
 			if moduleFile != "" {
 				add(moduleFile, &discovered)
 			}
@@ -846,7 +862,7 @@ func scanFilesForProperty(roots []string, propertyName string) []string {
 	return hits
 }
 
-func resolveModuleFileFromProperty(pageObjectFile string, propertyName string) string {
+func resolveModuleFileFromProperty(pageObjectFile string, propertyName string, tscp *config.TsConfigPaths) string {
 	typeName, importPath := findPropertyTypeAndImport(pageObjectFile, propertyName)
 	if typeName == "" {
 		return ""
@@ -854,10 +870,7 @@ func resolveModuleFileFromProperty(pageObjectFile string, propertyName string) s
 	if importPath == "" {
 		return ""
 	}
-	if !strings.HasPrefix(importPath, ".") {
-		return ""
-	}
-	return resolveLocalImportFile(pageObjectFile, importPath)
+	return resolveImportFile(pageObjectFile, importPath, tscp)
 }
 
 func findPropertyTypeAndImport(filePath, propertyName string) (string, string) {
@@ -971,12 +984,12 @@ func importSpecIncludesSymbol(importSpec string, symbol string) bool {
 	return false
 }
 
-func isNepRelatedFile(path string) bool {
+func isNepRelatedFile(path string, inheritanceGraph *analyzer.InheritanceGraph) bool {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return false
 	}
-	return isNepRelatedText(string(b))
+	return isNepRelated(path, string(b), inheritanceGraph)
 }
 
 func isNepRelatedText(text string) bool {
@@ -986,6 +999,16 @@ func isNepRelatedText(text string) bool {
 		if strings.Contains(text, m) {
 			return true
 		}
+	}
+	return false
+}
+
+func isNepRelated(path string, text string, inheritanceGraph *analyzer.InheritanceGraph) bool {
+	if isNepRelatedText(text) {
+		return true
+	}
+	if inheritanceGraph != nil {
+		return inheritanceGraph.IsNepRelated(path)
 	}
 	return false
 }
@@ -1124,6 +1147,110 @@ func resolveLocalImportFile(baseFile, importPath string) string {
 		}
 	}
 	return ""
+}
+
+func resolveImportFile(baseFile, importPath string, tscp *config.TsConfigPaths) string {
+	if strings.HasPrefix(importPath, ".") {
+		return resolveLocalImportFile(baseFile, importPath)
+	}
+	if tscp != nil && tscp.CanResolve(importPath) {
+		for _, candidate := range tscp.Resolve(importPath) {
+			info, err := os.Stat(candidate)
+			if err == nil && !info.IsDir() {
+				return candidate
+			}
+		}
+	}
+	return ""
+}
+
+func isLocalImportPath(importPath string, tscp *config.TsConfigPaths) bool {
+	if strings.HasPrefix(importPath, ".") {
+		return true
+	}
+	return tscp != nil && tscp.CanResolve(importPath)
+}
+
+func scanExtendedDirectories(cfg *config.Config, _ *config.TsConfigPaths, inheritanceGraph *analyzer.InheritanceGraph) []string {
+	if cfg == nil || len(cfg.ScanDirectories) == 0 {
+		return nil
+	}
+
+	sourceRoot := strings.TrimSpace(cfg.Source.Dir)
+	if sourceRoot == "" {
+		sourceRoot = "."
+	}
+
+	var candidates []string
+	seen := make(map[string]struct{})
+	for _, dir := range cfg.ScanDirectories {
+		absDir := filepath.Join(sourceRoot, dir)
+		_ = filepath.Walk(absDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if info.IsDir() {
+				switch info.Name() {
+				case ".git", "node_modules", "dist":
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !isScriptFile(info.Name()) {
+				return nil
+			}
+			content, readErr := os.ReadFile(path)
+			if readErr != nil {
+				return nil
+			}
+			cleanPath := filepath.Clean(path)
+			if !isNepRelated(cleanPath, string(content), inheritanceGraph) {
+				return nil
+			}
+			if _, ok := seen[cleanPath]; ok {
+				return nil
+			}
+			seen[cleanPath] = struct{}{}
+			candidates = append(candidates, cleanPath)
+			return nil
+		})
+	}
+	return uniqueStrings(candidates)
+}
+
+func findNearestTSConfigFromAnalyses(analyses []*types.FullAnalysis) string {
+	for _, analysis := range analyses {
+		if analysis == nil || analysis.FilePath == "" {
+			continue
+		}
+		if tsconfigPath := findNearestTSConfig(analysis.FilePath); tsconfigPath != "" {
+			return tsconfigPath
+		}
+	}
+	return ""
+}
+
+func findNearestTSConfig(filePath string) string {
+	cur := filepath.Dir(filePath)
+	for cur != "" {
+		candidate := filepath.Join(cur, "tsconfig.json")
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+	return ""
+}
+
+func findProjectRootForFile(filePath string) string {
+	if tsconfigPath := findNearestTSConfig(filePath); tsconfigPath != "" {
+		return filepath.Dir(tsconfigPath)
+	}
+	return filepath.Dir(filePath)
 }
 
 func buildImportCandidates(base string) []string {

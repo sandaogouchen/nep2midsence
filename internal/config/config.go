@@ -35,6 +35,9 @@ type Config struct {
 	InfraTerminalMethods  string              `json:"infra_terminal_methods" yaml:"infra_terminal_methods"`
 	SourceDir             string              `json:"source_dir" yaml:"source_dir"`
 	Workers               int                 `json:"workers" yaml:"workers"`
+	ScanDirectories       []string            `json:"scan_directories" yaml:"scan_directories"`
+	EnableImportChain     bool                `json:"enable_import_chain" yaml:"enable_import_chain"`
+	ImportChainMaxDepth   int                 `json:"import_chain_max_depth" yaml:"import_chain_max_depth"`
 	configPath            string              `json:"-" yaml:"-"`
 }
 
@@ -116,6 +119,9 @@ func DefaultConfig() *Config {
 		TSExtractor:    TSExtractorConfig{NodePath: "node", ScriptPath: "scripts/dist/ts-ast-extractor.js", Timeout: 30},
 		Fingerprint:    FingerprintConfig{CustomMappings: make(map[string]string)},
 		SourceDir:      ".", Workers: 4,
+		ScanDirectories:     []string{"e2e/pages", "e2e/utils/coreComponents", "e2e/utils"},
+		EnableImportChain:   true,
+		ImportChainMaxDepth: 20,
 	}
 	cfg.applyBuiltInWrapperFilter()
 	cfg.normalizeWrapperFilterAliases()

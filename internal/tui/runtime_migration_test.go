@@ -284,7 +284,7 @@ export class AdGroupPage {
 		}},
 	}
 
-	deps := tracePropertyChainDeps(ca)
+	deps := tracePropertyChainDeps(ca, nil)
 	joined := strings.Join(deps, "\n")
 	if !strings.Contains(joined, filepath.Clean(poPath)) {
 		t.Fatalf("deps missing page object file: %v", deps)
