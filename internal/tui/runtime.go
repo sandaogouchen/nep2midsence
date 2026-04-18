@@ -165,7 +165,7 @@ func (r *AppRuntime) RunStart(ctx context.Context, dir string, targetBaseDir str
 	}
 
 	// Build execution plan: migrate shared helper/wrapper files first, then migrate cases.
-	plan, err := buildMigrationPlan(engine, analyses, store)
+	plan, err := buildMigrationPlan(r.cfg, engine, analyses, store)
 	if err != nil {
 		return nil, err
 	}
@@ -210,7 +210,7 @@ func (r *AppRuntime) RunStart(ctx context.Context, dir string, targetBaseDir str
 	for _, t := range plan.Skipped {
 		completed++
 		successes++
-		_ = store.RecordTaskResult(runID, t.File, "skipped", "up-to-date", t.Kind, t.SourceHash, t.TargetFile, time.Now())
+		_ = store.RecordTaskResult(runID, t.TaskKey, t.File, "skipped", "up-to-date", t.Kind, t.SourceHash, t.TargetFile, time.Now())
 		notify(WorkflowEvent{
 			Stage:       "execute",
 			Current:     completed,
@@ -235,9 +235,10 @@ func (r *AppRuntime) RunStart(ctx context.Context, dir string, targetBaseDir str
 			return
 		}
 		file := result.CaseFile
-		meta, ok := plan.MetaByFile[file]
+		taskKey := result.TaskKey
+		meta, ok := plan.MetaByTaskKey[taskKey]
 		if !ok {
-			meta = planItemMeta{File: file, Kind: "case", TargetFile: result.TargetFile}
+			meta = planItemMeta{TaskKey: taskKey, File: file, Kind: "case", TargetFile: result.TargetFile}
 		}
 
 		status := "failed"
@@ -257,7 +258,7 @@ func (r *AppRuntime) RunStart(ctx context.Context, dir string, targetBaseDir str
 		current := completed
 		progressMu.Unlock()
 
-		_ = store.RecordTaskResult(runID, file, status, errMsg, meta.Kind, meta.SourceHash, meta.TargetFile, time.Now())
+		_ = store.RecordTaskResult(runID, meta.TaskKey, file, status, errMsg, meta.Kind, meta.SourceHash, meta.TargetFile, time.Now())
 		notify(WorkflowEvent{
 			Stage:       "execute",
 			Current:     current,
@@ -355,6 +356,7 @@ func (r *AppRuntime) RunStart(ctx context.Context, dir string, targetBaseDir str
 }
 
 type planItemMeta struct {
+	TaskKey    string
 	File       string
 	TargetFile string
 	Kind       string
@@ -367,45 +369,79 @@ type migrationPlan struct {
 	AlreadyMigrated  []planItemMeta
 	ToExecuteHelpers []*types.FullAnalysis
 	ToExecuteCases   []*types.FullAnalysis
-	MetaByFile      map[string]planItemMeta
+	MetaByTaskKey    map[string]planItemMeta
 }
 
-func buildMigrationPlan(engine *analyzer.Engine, analyses []*types.FullAnalysis, store *executor.StateStore) (*migrationPlan, error) {
+type helperReceiverCandidate struct {
+	Receiver       string
+	PageObjectFile string
+	MethodsByCase  map[string]map[string]struct{}
+	CaseFiles      []string
+}
+
+type helperReceiverResolution struct {
+	Receiver          string
+	PageObjectFile    string
+	Analysis          *types.FullAnalysis
+	ResolvedMethods   []string
+	UnresolvedReasons map[string]string
+	Dependencies      []string
+}
+
+func buildMigrationPlan(cfg *config.Config, engine *analyzer.Engine, analyses []*types.FullAnalysis, store *executor.StateStore) (*migrationPlan, error) {
 	// Partition: treat files with tests as cases.
 	var cases []*types.FullAnalysis
 	for _, a := range analyses {
 		if isCaseAnalysis(a) {
+			a.TaskKind = "case"
+			a.TaskKey = defaultTaskKey("case", a.FilePath)
 			cases = append(cases, a)
 		}
 	}
 
+	var tscp *config.TsConfigPaths
+	var inheritanceGraph *analyzer.InheritanceGraph
+	if tsconfigPath := findNearestTSConfigFromAnalyses(analyses); tsconfigPath != "" {
+		if loaded, err := config.LoadTsConfig(tsconfigPath); err == nil {
+			tscp = loaded
+			inheritanceGraph = analyzer.BuildInheritanceGraph(loaded.ProjectRoot, loaded)
+		}
+	}
+	if inheritanceGraph == nil && len(cases) > 0 {
+		inheritanceGraph = analyzer.BuildInheritanceGraph(findProjectRootForFile(cases[0].FilePath), tscp)
+	}
+
 	// Discover helper candidates from all cases.
 	helperPaths := make(map[string]struct{})
+	receiverCandidates := make(map[string]*helperReceiverCandidate)
 	for _, ca := range cases {
-		deps := collectLocalImportDeps(ca)
+		deps := collectLocalImportDeps(ca, tscp)
 		funcNames := collectCandidateFuncNames(ca)
 		scanned := scanHelperCandidates(filepath.Dir(ca.FilePath), funcNames)
-		chainDeps := tracePropertyChainDeps(ca)
+		chainDeps := tracePropertyChainDeps(ca, tscp)
+		extended := scanExtendedDirectories(cfg, tscp, inheritanceGraph)
 
 		// Dependencies provide context; helper candidates may be migrated.
-		ca.Dependencies = uniqueStrings(append(append(deps, scanned...), chainDeps...))
+		ca.Dependencies = uniqueStrings(append(append(append(deps, scanned...), chainDeps...), extended...))
 		for _, p := range scanned {
 			helperPaths[p] = struct{}{}
 		}
 		for _, p := range chainDeps {
 			helperPaths[p] = struct{}{}
 		}
+		for _, p := range extended {
+			helperPaths[p] = struct{}{}
+		}
 		for _, p := range deps {
 			// If a local import is NEP-related, it should also be migrated.
-			if isNepRelatedFile(p) {
+			if isNepRelatedFile(p, inheritanceGraph) {
 				helperPaths[p] = struct{}{}
 			}
 		}
+		collectHelperReceiverCandidates(ca, receiverCandidates)
 	}
 
-	// Analyze helper files, skipping those already migrated to Midscene.
-	var helpers []*types.FullAnalysis
-	var alreadyMigratedMetas []planItemMeta
+	// Analyze helper-related files for DEFAULT_PROMPT extraction and case context.
 	defaultPromptsByFile := make(map[string][]types.DefaultPromptInfo)
 	for p := range helperPaths {
 		a, err := engine.AnalyzeFile(p)
@@ -414,27 +450,87 @@ func buildMigrationPlan(engine *analyzer.Engine, analyses []*types.FullAnalysis,
 			continue
 		}
 		// Add its own local deps for context.
-		a.Dependencies = uniqueStrings(collectLocalImportDeps(a))
+		a.Dependencies = uniqueStrings(collectLocalImportDeps(a, tscp))
 		// Extract component DEFAULT_PROMPTs for later use in case prompt generation.
 		a.DefaultPrompts = analyzer.ExtractDefaultPrompts(a.FilePath)
 		if len(a.DefaultPrompts) > 0 {
 			defaultPromptsByFile[a.FilePath] = a.DefaultPrompts
 		}
+	}
 
-		// Check if this helper has already been migrated at its target path.
-		helperFuncNames := extractDefinedFuncNames(a)
-		if isHelperAlreadyMigrated(a.TargetPath, helperFuncNames) {
-			hash, _ := sha256File(a.FilePath)
+	var helpers []*types.FullAnalysis
+	var alreadyMigratedMetas []planItemMeta
+	unresolvedByCase := make(map[string][]types.UnresolvedHelper)
+	caseByFilePath := make(map[string]*types.FullAnalysis, len(cases))
+	for _, ca := range cases {
+		if ca != nil {
+			caseByFilePath[ca.FilePath] = ca
+		}
+	}
+	receiverKeys := make([]string, 0, len(receiverCandidates))
+	for receiver := range receiverCandidates {
+		receiverKeys = append(receiverKeys, receiver)
+	}
+	sort.Strings(receiverKeys)
+
+	for _, receiver := range receiverKeys {
+		candidate := receiverCandidates[receiver]
+		resolution, err := resolveHelperReceiverCandidate(candidate, tscp, engine)
+		if err != nil {
+			attachUnresolvedReceiver(candidate, unresolvedByCase, err.Error())
+			continue
+		}
+		if resolution == nil {
+			continue
+		}
+
+		for caseFile, methods := range candidate.MethodsByCase {
+			for _, method := range sortedSet(methods) {
+				if reason := resolution.UnresolvedReasons[method]; reason != "" {
+					unresolvedByCase[caseFile] = append(unresolvedByCase[caseFile], types.UnresolvedHelper{
+						Receiver: receiver,
+						Method:   method,
+						Reason:   reason,
+					})
+				}
+			}
+		}
+
+		if resolution.Analysis == nil || len(resolution.ResolvedMethods) == 0 {
+			continue
+		}
+
+		missingMethods := collectMissingHelperMethods(resolution.Analysis.TargetPath, resolution.ResolvedMethods)
+		if len(missingMethods) == 0 {
+			hash, _ := sha256File(resolution.Analysis.FilePath)
 			alreadyMigratedMetas = append(alreadyMigratedMetas, planItemMeta{
-				File:       a.FilePath,
-				TargetFile: a.TargetPath,
+				TaskKey:    helperTaskKey(resolution.Analysis.TargetPath, receiver, resolution.ResolvedMethods),
+				File:       resolution.Analysis.FilePath,
+				TargetFile: resolution.Analysis.TargetPath,
 				Kind:       "helper",
 				SourceHash: hash,
 			})
 			continue
 		}
 
-		helpers = append(helpers, a)
+		helperAnalysis := cloneAnalysis(resolution.Analysis)
+		helperAnalysis.TaskKind = "helper"
+		helperAnalysis.TaskKey = helperTaskKey(helperAnalysis.TargetPath, receiver, missingMethods)
+		helperAnalysis.HelperPlan = &types.HelperMigrationPlan{
+			Receiver:       receiver,
+			PageObjectFile: resolution.PageObjectFile,
+			Methods:        append([]string(nil), missingMethods...),
+		}
+		helperAnalysis.Dependencies = uniqueStrings(append(helperAnalysis.Dependencies, resolution.Dependencies...))
+		helpers = append(helpers, helperAnalysis)
+
+		for caseFile := range candidate.MethodsByCase {
+			ca := caseByFilePath[caseFile]
+			if ca == nil {
+				continue
+			}
+			ca.Dependencies = uniqueStrings(append(ca.Dependencies, helperAnalysis.TargetPath))
+		}
 	}
 
 	// Attach DEFAULT_PROMPT entries from dependencies to each case so the prompt
@@ -459,36 +555,35 @@ func buildMigrationPlan(engine *analyzer.Engine, analyses []*types.FullAnalysis,
 				ca.DefaultPrompts = append(ca.DefaultPrompts, dp)
 			}
 		}
+		ca.UnresolvedHelpers = uniqueUnresolvedHelpers(unresolvedByCase[ca.FilePath])
 	}
 
-	// Dedup helpers/cases by absolute path.
-	helperByFile := make(map[string]*types.FullAnalysis)
+	// Dedup helpers/cases by task key.
+	helperByTask := make(map[string]*types.FullAnalysis)
 	for _, h := range helpers {
 		if h == nil {
 			continue
 		}
-		fp := filepath.Clean(h.FilePath)
-		helperByFile[fp] = h
+		helperByTask[h.TaskKey] = h
 	}
-	caseByFile := make(map[string]*types.FullAnalysis)
+	caseByTask := make(map[string]*types.FullAnalysis)
 	for _, c := range cases {
 		if c == nil {
 			continue
 		}
-		fp := filepath.Clean(c.FilePath)
-		caseByFile[fp] = c
+		caseByTask[c.TaskKey] = c
 	}
 
-	plan := &migrationPlan{MetaByFile: make(map[string]planItemMeta), AlreadyMigrated: alreadyMigratedMetas}
+	plan := &migrationPlan{MetaByTaskKey: make(map[string]planItemMeta), AlreadyMigrated: alreadyMigratedMetas}
 	// preserve a stable order for execution.
-	sortedHelpers := make([]string, 0, len(helperByFile))
-	for fp := range helperByFile {
-		sortedHelpers = append(sortedHelpers, fp)
+	sortedHelpers := make([]string, 0, len(helperByTask))
+	for taskKey := range helperByTask {
+		sortedHelpers = append(sortedHelpers, taskKey)
 	}
 	sort.Strings(sortedHelpers)
-	sortedCases := make([]string, 0, len(caseByFile))
-	for fp := range caseByFile {
-		sortedCases = append(sortedCases, fp)
+	sortedCases := make([]string, 0, len(caseByTask))
+	for taskKey := range caseByTask {
+		sortedCases = append(sortedCases, taskKey)
 	}
 	sort.Strings(sortedCases)
 
@@ -501,26 +596,230 @@ func buildMigrationPlan(engine *analyzer.Engine, analyses []*types.FullAnalysis,
 		if err != nil {
 			hash = ""
 		}
-		meta := planItemMeta{File: a.FilePath, Kind: kind, TargetFile: a.TargetPath, SourceHash: hash}
-		plan.MetaByFile[a.FilePath] = meta
+		taskKey := a.TaskKey
+		if taskKey == "" {
+			taskKey = defaultTaskKey(kind, a.FilePath)
+			a.TaskKey = taskKey
+		}
+		meta := planItemMeta{TaskKey: taskKey, File: a.FilePath, Kind: kind, TargetFile: a.TargetPath, SourceHash: hash}
+		plan.MetaByTaskKey[taskKey] = meta
 		plan.TotalPlanned++
-		if store != nil && hash != "" && store.IsUpToDate(a.FilePath, hash, a.TargetPath) {
+		if store != nil && hash != "" && store.IsUpToDate(taskKey, hash, a.TargetPath) {
 			plan.Skipped = append(plan.Skipped, meta)
 			return
 		}
 		*toExecute = append(*toExecute, a)
 	}
 
-	for _, fp := range sortedHelpers {
-		addPlanned("helper", helperByFile[fp], &plan.ToExecuteHelpers)
+	for _, taskKey := range sortedHelpers {
+		addPlanned("helper", helperByTask[taskKey], &plan.ToExecuteHelpers)
 	}
-	for _, fp := range sortedCases {
-		addPlanned("case", caseByFile[fp], &plan.ToExecuteCases)
+	for _, taskKey := range sortedCases {
+		addPlanned("case", caseByTask[taskKey], &plan.ToExecuteCases)
 	}
 
 	// Ensure skipped list order is stable.
 	sort.Slice(plan.Skipped, func(i, j int) bool { return plan.Skipped[i].File < plan.Skipped[j].File })
 	return plan, nil
+}
+
+func collectHelperReceiverCandidates(ca *types.FullAnalysis, candidates map[string]*helperReceiverCandidate) {
+	if ca == nil {
+		return
+	}
+	for _, chain := range ca.CallChains {
+		for _, step := range chain.Steps {
+			if !step.IsWrapperCall {
+				continue
+			}
+			receiver := strings.TrimSpace(step.FullReceiver)
+			method := strings.TrimSpace(step.FuncName)
+			if receiver == "" || method == "" {
+				continue
+			}
+			candidate := candidates[receiver]
+			if candidate == nil {
+				candidate = &helperReceiverCandidate{
+					Receiver:       receiver,
+					PageObjectFile: filepath.Clean(step.OwnerFile),
+					MethodsByCase:  make(map[string]map[string]struct{}),
+				}
+				candidates[receiver] = candidate
+			}
+			if candidate.PageObjectFile == "" && strings.TrimSpace(step.OwnerFile) != "" {
+				candidate.PageObjectFile = filepath.Clean(step.OwnerFile)
+			}
+			if candidate.MethodsByCase[ca.FilePath] == nil {
+				candidate.MethodsByCase[ca.FilePath] = make(map[string]struct{})
+				candidate.CaseFiles = append(candidate.CaseFiles, ca.FilePath)
+			}
+			candidate.MethodsByCase[ca.FilePath][method] = struct{}{}
+		}
+	}
+}
+
+func resolveHelperReceiverCandidate(candidate *helperReceiverCandidate, tscp *config.TsConfigPaths, engine *analyzer.Engine) (*helperReceiverResolution, error) {
+	if candidate == nil {
+		return nil, nil
+	}
+	pageObjectFile := strings.TrimSpace(candidate.PageObjectFile)
+	if pageObjectFile == "" && len(candidate.CaseFiles) > 0 {
+		parts := strings.Split(strings.TrimSpace(candidate.Receiver), ".")
+		propertyName := ""
+		if len(parts) >= 2 {
+			propertyName = parts[len(parts)-1]
+		}
+		if propertyName != "" {
+			roots := findPageObjectSearchRoots(candidate.CaseFiles[0])
+			hits := scanFilesForProperty(roots, propertyName)
+			if len(hits) > 0 {
+				pageObjectFile = hits[0]
+			}
+		}
+	}
+	if pageObjectFile == "" {
+		return nil, fmt.Errorf("page object not found for receiver %s", candidate.Receiver)
+	}
+
+	moduleFile := pageObjectFile
+	parts := strings.Split(strings.TrimSpace(candidate.Receiver), ".")
+	if len(parts) >= 2 {
+		propertyName := parts[len(parts)-1]
+		resolved := resolveModuleFileFromProperty(pageObjectFile, propertyName, tscp)
+		if resolved == "" && len(candidate.CaseFiles) > 0 {
+			roots := findPageObjectSearchRoots(candidate.CaseFiles[0])
+			for _, poFile := range scanFilesForProperty(roots, propertyName) {
+				if poFile == "" {
+					continue
+				}
+				pageObjectFile = poFile
+				resolved = resolveModuleFileFromProperty(pageObjectFile, propertyName, tscp)
+				if resolved != "" {
+					break
+				}
+			}
+		}
+		if resolved == "" {
+			return nil, fmt.Errorf("module file not found for receiver %s property %s", candidate.Receiver, propertyName)
+		}
+		moduleFile = resolved
+	}
+
+	analysis, err := engine.AnalyzeFile(moduleFile)
+	if err != nil {
+		return nil, fmt.Errorf("analyze helper module %s: %w", moduleFile, err)
+	}
+	analysis.Dependencies = uniqueStrings(collectLocalImportDeps(analysis, tscp))
+
+	sourceBytes, err := os.ReadFile(moduleFile)
+	if err != nil {
+		return nil, fmt.Errorf("read helper module %s: %w", moduleFile, err)
+	}
+	sourceText := string(sourceBytes)
+
+	resolution := &helperReceiverResolution{
+		Receiver:          candidate.Receiver,
+		PageObjectFile:    pageObjectFile,
+		Analysis:          analysis,
+		UnresolvedReasons: make(map[string]string),
+	}
+	if pageObjectFile != "" && filepath.Clean(pageObjectFile) != filepath.Clean(moduleFile) {
+		resolution.Dependencies = append(resolution.Dependencies, filepath.Clean(pageObjectFile))
+	}
+
+	for _, method := range allCandidateMethods(candidate) {
+		if methodDefinedInAnalysis(analysis, method) || containsMethodDefinition(sourceText, method) {
+			resolution.ResolvedMethods = append(resolution.ResolvedMethods, method)
+			continue
+		}
+		resolution.UnresolvedReasons[method] = fmt.Sprintf("method definition not found in module source %s", moduleFile)
+	}
+	sort.Strings(resolution.ResolvedMethods)
+	return resolution, nil
+}
+
+func allCandidateMethods(candidate *helperReceiverCandidate) []string {
+	seen := make(map[string]struct{})
+	var methods []string
+	for _, methodSet := range candidate.MethodsByCase {
+		for method := range methodSet {
+			if _, ok := seen[method]; ok {
+				continue
+			}
+			seen[method] = struct{}{}
+			methods = append(methods, method)
+		}
+	}
+	sort.Strings(methods)
+	return methods
+}
+
+func sortedSet(items map[string]struct{}) []string {
+	out := make([]string, 0, len(items))
+	for item := range items {
+		out = append(out, item)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func attachUnresolvedReceiver(candidate *helperReceiverCandidate, unresolvedByCase map[string][]types.UnresolvedHelper, reason string) {
+	if candidate == nil {
+		return
+	}
+	for caseFile, methodSet := range candidate.MethodsByCase {
+		for _, method := range sortedSet(methodSet) {
+			unresolvedByCase[caseFile] = append(unresolvedByCase[caseFile], types.UnresolvedHelper{
+				Receiver: candidate.Receiver,
+				Method:   method,
+				Reason:   reason,
+			})
+		}
+	}
+}
+
+func cloneAnalysis(a *types.FullAnalysis) *types.FullAnalysis {
+	if a == nil {
+		return nil
+	}
+	cp := *a
+	cp.Dependencies = append([]string(nil), a.Dependencies...)
+	cp.DefaultPrompts = append([]types.DefaultPromptInfo(nil), a.DefaultPrompts...)
+	cp.UnresolvedHelpers = append([]types.UnresolvedHelper(nil), a.UnresolvedHelpers...)
+	return &cp
+}
+
+func defaultTaskKey(kind string, filePath string) string {
+	return fmt.Sprintf("%s::%s", strings.TrimSpace(kind), filepath.Clean(filePath))
+}
+
+func helperTaskKey(targetPath, receiver string, methods []string) string {
+	sortedMethods := append([]string(nil), methods...)
+	sort.Strings(sortedMethods)
+	return fmt.Sprintf("helper::%s::%s::%s", filepath.Clean(targetPath), strings.TrimSpace(receiver), strings.Join(sortedMethods, ","))
+}
+
+func uniqueUnresolvedHelpers(items []types.UnresolvedHelper) []types.UnresolvedHelper {
+	if len(items) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(items))
+	out := make([]types.UnresolvedHelper, 0, len(items))
+	for _, item := range items {
+		key := strings.Join([]string{strings.TrimSpace(item.Receiver), strings.TrimSpace(item.Method), strings.TrimSpace(item.Reason)}, "|")
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, item)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Receiver == out[j].Receiver {
+			return out[i].Method < out[j].Method
+		}
+		return out[i].Receiver < out[j].Receiver
+	})
+	return out
 }
 
 func isCaseAnalysis(a *types.FullAnalysis) bool {
@@ -535,16 +834,16 @@ func isCaseAnalysis(a *types.FullAnalysis) bool {
 	return false
 }
 
-func collectLocalImportDeps(a *types.FullAnalysis) []string {
+func collectLocalImportDeps(a *types.FullAnalysis, tscp *config.TsConfigPaths) []string {
 	if a == nil || a.AST == nil {
 		return nil
 	}
 	var deps []string
 	for _, imp := range a.AST.Imports {
-		if !strings.HasPrefix(imp.Path, ".") {
+		if !isLocalImportPath(imp.Path, tscp) {
 			continue
 		}
-		resolved := resolveLocalImportFile(a.FilePath, imp.Path)
+		resolved := resolveImportFile(a.FilePath, imp.Path, tscp)
 		if resolved == "" {
 			continue
 		}
@@ -651,11 +950,13 @@ func scanHelperCandidates(caseDir string, funcNames []string) []string {
 
 // tracePropertyChainDeps discovers helper/module/component files referenced via
 // multi-level property access chains in a case, e.g.:
-//   adGroupPage.optimizationAndBiddingModule1MNBA.vv_setStandardBtn()
+//
+//	adGroupPage.optimizationAndBiddingModule1MNBA.vv_setStandardBtn()
+//
 // The core goal is to find the PageObject/module files that define the
 // intermediate property (optimizationAndBiddingModule1MNBA) so they can be
 // migrated before the case.
-func tracePropertyChainDeps(ca *types.FullAnalysis) []string {
+func tracePropertyChainDeps(ca *types.FullAnalysis, tscp *config.TsConfigPaths) []string {
 	props := collectWrapperPropertyNames(ca)
 	if len(props) == 0 {
 		return nil
@@ -684,7 +985,7 @@ func tracePropertyChainDeps(ca *types.FullAnalysis) []string {
 		candidates := scanFilesForProperty(roots, prop)
 		for _, poFile := range candidates {
 			add(poFile, &discovered)
-			moduleFile := resolveModuleFileFromProperty(poFile, prop)
+			moduleFile := resolveModuleFileFromProperty(poFile, prop, tscp)
 			if moduleFile != "" {
 				add(moduleFile, &discovered)
 			}
@@ -846,18 +1147,25 @@ func scanFilesForProperty(roots []string, propertyName string) []string {
 	return hits
 }
 
-func resolveModuleFileFromProperty(pageObjectFile string, propertyName string) string {
+func resolveModuleFileFromProperty(pageObjectFile string, propertyName string, tscp *config.TsConfigPaths) string {
 	typeName, importPath := findPropertyTypeAndImport(pageObjectFile, propertyName)
-	if typeName == "" {
+	searchName := strings.TrimSpace(typeName)
+	if searchName == "" {
+		searchName = strings.TrimSpace(propertyName)
+	}
+	if importPath != "" {
+		if resolved := resolveImportFile(pageObjectFile, importPath, tscp); resolved != "" {
+			return resolved
+		}
+	}
+	if searchName == "" {
 		return ""
 	}
-	if importPath == "" {
-		return ""
+	hits := scanFilesByBaseName([]string{filepath.Dir(pageObjectFile)}, searchName)
+	if len(hits) > 0 {
+		return hits[0]
 	}
-	if !strings.HasPrefix(importPath, ".") {
-		return ""
-	}
-	return resolveLocalImportFile(pageObjectFile, importPath)
+	return ""
 }
 
 func findPropertyTypeAndImport(filePath, propertyName string) (string, string) {
@@ -874,7 +1182,7 @@ func findPropertyTypeAndImport(filePath, propertyName string) (string, string) {
 	}
 
 	// Try to infer the type from either a type annotation or a `new TypeName(...)` assignment.
-	typeRe := regexp.MustCompile(`\b` + regexp.QuoteMeta(propertyName) + `\s*\??\s*:\s*([A-Za-z_$][\w$]*)`)
+	typeRe := regexp.MustCompile(`\b` + regexp.QuoteMeta(propertyName) + `\s*[!?]?\s*:\s*([A-Za-z_$][\w$]*)`)
 	newRe := regexp.MustCompile(`\b` + regexp.QuoteMeta(propertyName) + `\s*=\s*new\s+([A-Za-z_$][\w$]*)`)
 
 	typeName := ""
@@ -971,12 +1279,50 @@ func importSpecIncludesSymbol(importSpec string, symbol string) bool {
 	return false
 }
 
-func isNepRelatedFile(path string) bool {
+func scanFilesByBaseName(roots []string, baseName string) []string {
+	baseName = strings.TrimSpace(baseName)
+	if baseName == "" {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var hits []string
+	for _, root := range roots {
+		_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if d.IsDir() {
+				switch d.Name() {
+				case ".git", "node_modules", "dist":
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !isScriptFile(d.Name()) {
+				return nil
+			}
+			if strings.TrimSuffix(d.Name(), filepath.Ext(d.Name())) != baseName {
+				return nil
+			}
+			clean := filepath.Clean(path)
+			if _, ok := seen[clean]; ok {
+				return nil
+			}
+			seen[clean] = struct{}{}
+			hits = append(hits, clean)
+			return nil
+		})
+	}
+	sort.Strings(hits)
+	return hits
+}
+
+func isNepRelatedFile(path string, inheritanceGraph *analyzer.InheritanceGraph) bool {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return false
 	}
-	return isNepRelatedText(string(b))
+	return isNepRelated(path, string(b), inheritanceGraph)
 }
 
 func isNepRelatedText(text string) bool {
@@ -986,6 +1332,16 @@ func isNepRelatedText(text string) bool {
 		if strings.Contains(text, m) {
 			return true
 		}
+	}
+	return false
+}
+
+func isNepRelated(path string, text string, inheritanceGraph *analyzer.InheritanceGraph) bool {
+	if isNepRelatedText(text) {
+		return true
+	}
+	if inheritanceGraph != nil {
+		return inheritanceGraph.IsNepRelated(path)
 	}
 	return false
 }
@@ -1057,6 +1413,114 @@ func isHelperAlreadyMigrated(targetPath string, funcNames []string) bool {
 	return false
 }
 
+func collectMissingHelperMethods(targetPath string, methods []string) []string {
+	var missing []string
+	for _, method := range methods {
+		if !isHelperMethodAlreadyMigrated(targetPath, method) {
+			missing = append(missing, method)
+		}
+	}
+	sort.Strings(missing)
+	return missing
+}
+
+func isHelperMethodAlreadyMigrated(targetPath string, method string) bool {
+	targetPath = strings.TrimSpace(targetPath)
+	method = strings.TrimSpace(method)
+	if targetPath == "" || method == "" {
+		return false
+	}
+	content, err := os.ReadFile(targetPath)
+	if err != nil {
+		return false
+	}
+	text := string(content)
+	for _, candidate := range helperMethodCandidateNames(method) {
+		block := extractHelperMethodBlock(text, candidate)
+		if block == "" {
+			continue
+		}
+		if isMidsceneText(block) && !isNepRelatedText(block) {
+			return true
+		}
+	}
+	return false
+}
+
+func helperMethodCandidateNames(method string) []string {
+	method = strings.TrimSpace(method)
+	if method == "" {
+		return nil
+	}
+	candidates := []string{method}
+	if !strings.HasSuffix(method, "Midscene") {
+		candidates = append(candidates, method+"Midscene")
+	}
+	return candidates
+}
+
+func methodDefinedInAnalysis(a *types.FullAnalysis, method string) bool {
+	if a == nil || a.AST == nil {
+		return false
+	}
+	for _, fn := range a.AST.Functions {
+		if strings.TrimSpace(fn.Name) == strings.TrimSpace(method) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsMethodDefinition(text string, method string) bool {
+	return extractHelperMethodBlock(text, method) != ""
+}
+
+func extractHelperMethodBlock(text string, method string) string {
+	method = strings.TrimSpace(method)
+	if text == "" || method == "" {
+		return ""
+	}
+	patterns := []*regexp.Regexp{
+		regexp.MustCompile(`(?m)(?:export\s+)?(?:async\s+)?function\s+` + regexp.QuoteMeta(method) + `\s*\([^)]*\)\s*(?::\s*[^{=]+)?\s*\{`),
+		regexp.MustCompile(`(?m)(?:public\s+|private\s+|protected\s+|static\s+|readonly\s+)*(?:async\s+)?` + regexp.QuoteMeta(method) + `\s*\([^)]*\)\s*(?::\s*[^{=]+)?\s*\{`),
+		regexp.MustCompile(`(?m)` + regexp.QuoteMeta(method) + `\s*[:=]\s*(?:async\s*)?\([^)]*\)\s*=>\s*\{`),
+	}
+	for _, re := range patterns {
+		loc := re.FindStringIndex(text)
+		if len(loc) != 2 {
+			continue
+		}
+		start := loc[0]
+		braceStart := strings.Index(text[loc[0]:loc[1]], "{")
+		if braceStart < 0 {
+			continue
+		}
+		braceStart += loc[0]
+		end := matchBalancedBrace(text, braceStart)
+		if end <= braceStart {
+			continue
+		}
+		return text[start:end]
+	}
+	return ""
+}
+
+func matchBalancedBrace(text string, openIdx int) int {
+	depth := 0
+	for i := openIdx; i < len(text); i++ {
+		switch text[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
+	}
+	return -1
+}
+
 // extractDefinedFuncNames extracts non-test function names from a helper file's AST analysis.
 func extractDefinedFuncNames(a *types.FullAnalysis) []string {
 	if a == nil || a.AST == nil {
@@ -1124,6 +1588,110 @@ func resolveLocalImportFile(baseFile, importPath string) string {
 		}
 	}
 	return ""
+}
+
+func resolveImportFile(baseFile, importPath string, tscp *config.TsConfigPaths) string {
+	if strings.HasPrefix(importPath, ".") {
+		return resolveLocalImportFile(baseFile, importPath)
+	}
+	if tscp != nil && tscp.CanResolve(importPath) {
+		for _, candidate := range tscp.Resolve(importPath) {
+			info, err := os.Stat(candidate)
+			if err == nil && !info.IsDir() {
+				return candidate
+			}
+		}
+	}
+	return ""
+}
+
+func isLocalImportPath(importPath string, tscp *config.TsConfigPaths) bool {
+	if strings.HasPrefix(importPath, ".") {
+		return true
+	}
+	return tscp != nil && tscp.CanResolve(importPath)
+}
+
+func scanExtendedDirectories(cfg *config.Config, _ *config.TsConfigPaths, inheritanceGraph *analyzer.InheritanceGraph) []string {
+	if cfg == nil || len(cfg.ScanDirectories) == 0 {
+		return nil
+	}
+
+	sourceRoot := strings.TrimSpace(cfg.Source.Dir)
+	if sourceRoot == "" {
+		sourceRoot = "."
+	}
+
+	var candidates []string
+	seen := make(map[string]struct{})
+	for _, dir := range cfg.ScanDirectories {
+		absDir := filepath.Join(sourceRoot, dir)
+		_ = filepath.Walk(absDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if info.IsDir() {
+				switch info.Name() {
+				case ".git", "node_modules", "dist":
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !isScriptFile(info.Name()) {
+				return nil
+			}
+			content, readErr := os.ReadFile(path)
+			if readErr != nil {
+				return nil
+			}
+			cleanPath := filepath.Clean(path)
+			if !isNepRelated(cleanPath, string(content), inheritanceGraph) {
+				return nil
+			}
+			if _, ok := seen[cleanPath]; ok {
+				return nil
+			}
+			seen[cleanPath] = struct{}{}
+			candidates = append(candidates, cleanPath)
+			return nil
+		})
+	}
+	return uniqueStrings(candidates)
+}
+
+func findNearestTSConfigFromAnalyses(analyses []*types.FullAnalysis) string {
+	for _, analysis := range analyses {
+		if analysis == nil || analysis.FilePath == "" {
+			continue
+		}
+		if tsconfigPath := findNearestTSConfig(analysis.FilePath); tsconfigPath != "" {
+			return tsconfigPath
+		}
+	}
+	return ""
+}
+
+func findNearestTSConfig(filePath string) string {
+	cur := filepath.Dir(filePath)
+	for cur != "" {
+		candidate := filepath.Join(cur, "tsconfig.json")
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+	return ""
+}
+
+func findProjectRootForFile(filePath string) string {
+	if tsconfigPath := findNearestTSConfig(filePath); tsconfigPath != "" {
+		return filepath.Dir(tsconfigPath)
+	}
+	return filepath.Dir(filePath)
 }
 
 func buildImportCandidates(base string) []string {

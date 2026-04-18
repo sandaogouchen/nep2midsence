@@ -89,8 +89,8 @@ type Model struct {
 	lastResult           *WorkflowResult
 	statusSnapshot       executor.StateSnapshot
 	logScroll            int
-	targetBaseDir    string // cross-repo target directory
-	targetBrowsePath string // current path in target directory browser
+	targetBaseDir        string // cross-repo target directory
+	targetBrowsePath     string // current path in target directory browser
 }
 
 func NewModel(cfg *config.Config, runtime Runtime, opts Options) Model {
@@ -242,10 +242,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	case runtimeEventMsg:
 		m.currentStage = msg.event.Stage
-		m.progressCurrent = msg.event.Current
-		m.progressTotal = msg.event.Total
-		m.successes = msg.event.Successes
-		m.failures = msg.event.Failures
+		if msg.event.Current > 0 {
+			m.progressCurrent = msg.event.Current
+		}
+		if msg.event.Total > 0 {
+			m.progressTotal = msg.event.Total
+		}
+		if msg.event.Successes > 0 || (msg.event.Current == 0 && msg.event.Total == 0 && msg.event.Failures > 0) {
+			m.successes = msg.event.Successes
+		}
+		if msg.event.Failures > 0 || (msg.event.Current == 0 && msg.event.Total == 0 && msg.event.Successes > 0) {
+			m.failures = msg.event.Failures
+		}
 		if msg.event.CurrentFile != "" {
 			m.currentFile = msg.event.CurrentFile
 		}
@@ -280,9 +288,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) View() string {
 	header := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render("nep2midsence")
 	main := m.renderMain()
-	footer := lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("Commands: /help /start /analyze /status /history /config /model /version /clear /quit")
 	commandPanel := m.renderCommandPanel()
-	return strings.Join([]string{header, "", main, "", commandPanel, footer}, "\n")
+	return strings.Join([]string{header, "", main, "", commandPanel}, "\n")
 }
 
 func (m Model) handleCommand() (tea.Model, tea.Cmd) {
@@ -560,7 +567,10 @@ func (m Model) logViewportHeight() int {
 	if m.height <= 0 {
 		return 8
 	}
-	return maxInt(6, m.height-19)
+	if m.activeView == viewRunning {
+		return maxInt(6, m.height-11)
+	}
+	return maxInt(6, m.height-16)
 }
 
 func (m Model) visibleLogs() []string {
@@ -574,37 +584,26 @@ func (m Model) visibleLogs() []string {
 		start = len(m.logs)
 	}
 	end := minInt(start+height, len(m.logs))
-	lines := append([]string(nil), m.logs[start:end]...)
-	for len(lines) < height {
-		lines = append(lines, "")
-	}
-	return lines
+	return append([]string(nil), m.logs[start:end]...)
 }
 
 func (m Model) renderRunningView() string {
-	logsTitle := fmt.Sprintf("日志 %d 行", len(m.logs))
-	if len(m.logs) > m.logViewportHeight() {
-		logsTitle = fmt.Sprintf("%s  (%d/%d)", logsTitle, m.logScroll+1, m.maxLogScroll()+1)
+	contentWidth := maxInt(40, m.width-2)
+	stage := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81")).Render(strings.ToUpper(emptyFallback(m.currentStage, "queued")))
+	current := lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Render(emptyFallback(m.currentFile, "-"))
+	header := joinEdge("Running "+stage+"  "+current, renderProgressSummary(m.progressCurrent, m.progressTotal), contentWidth)
+
+	logs := strings.Join(m.visibleLogs(), "\n")
+	if strings.TrimSpace(logs) == "" {
+		logs = "暂无日志"
 	}
 
-	logBox := lipgloss.NewStyle().
-		Border(lipgloss.NormalBorder()).
-		BorderForeground(lipgloss.Color("62")).
-		Padding(0, 1).
-		Width(maxInt(20, m.width-6)).
-		Render(strings.Join(append([]string{logsTitle}, m.visibleLogs()...), "\n"))
+	hint := lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Render("Scroll: Up/Down PgUp/PgDn Home/End")
+	stats := renderShiftStats(m.progressTotal, m.successes, m.failures)
+	footer := joinEdge(hint, stats, contentWidth)
+	divider := lipgloss.NewStyle().Foreground(lipgloss.Color("238")).Render(strings.Repeat("─", contentWidth))
 
-	return fmt.Sprintf(
-		"Stage: %s\nCurrent file: %s\nProgress: %d/%d\nSucceeded: %d\nFailed: %d\n\n%s\n\n%s",
-		m.currentStage,
-		emptyFallback(m.currentFile, "-"),
-		m.progressCurrent,
-		m.progressTotal,
-		m.successes,
-		m.failures,
-		lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Render("日志区支持 Up/Down、PgUp/PgDn、Home/End"),
-		logBox,
-	)
+	return strings.Join([]string{header, divider, logs, divider, footer}, "\n")
 }
 
 func (m Model) renderMain() string {
@@ -655,15 +654,11 @@ func (m Model) renderMain() string {
 
 func (m Model) renderCommandPanel() string {
 	hintStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
-	boxStyle := lipgloss.NewStyle().
-		Border(lipgloss.NormalBorder()).
-		BorderForeground(lipgloss.Color("69")).
-		Padding(0, 1)
-
+	label := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("69")).Render("Command")
 	content := []string{
-		lipgloss.NewStyle().Bold(true).Render("Command Input"),
-		m.commandInput.View(),
-		hintStyle.Render("Type a slash command like /help or /start"),
+		hintStyle.Render(strings.Repeat("─", maxInt(20, m.width-2))),
+		label + "  " + m.commandInput.View(),
+		hintStyle.Render("Slash commands: /help /start /analyze /status /history /config /model /version /clear /quit"),
 	}
 	if m.lastError != "" {
 		content = append(content, lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render(m.lastError))
@@ -672,7 +667,7 @@ func (m Model) renderCommandPanel() string {
 		content = append(content, lipgloss.NewStyle().Foreground(lipgloss.Color("70")).Render(m.lastInfo))
 	}
 
-	return boxStyle.Render(strings.Join(content, "\n"))
+	return strings.Join(content, "\n")
 }
 
 func renderConfig(cfg *config.Config) string {
@@ -712,6 +707,47 @@ func emptyFallback(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func renderProgressSummary(current, total int) string {
+	if total <= 0 {
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Render("0/0")
+	}
+	return lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Render(fmt.Sprintf("%d/%d", current, total))
+}
+
+func renderShiftStats(planned, shifted, failed int) string {
+	pill := func(label string, value int, color lipgloss.Color) string {
+		return lipgloss.NewStyle().
+			Foreground(lipgloss.Color("15")).
+			Background(color).
+			Bold(true).
+			Padding(0, 1).
+			Render(fmt.Sprintf("%s %d", label, value))
+	}
+
+	return strings.Join([]string{
+		pill("Planned", planned, lipgloss.Color("62")),
+		pill("Shifted", shifted, lipgloss.Color("35")),
+		pill("Failed", failed, lipgloss.Color("160")),
+	}, " ")
+}
+
+func joinEdge(left, right string, width int) string {
+	if right == "" {
+		return left
+	}
+	if left == "" {
+		return right
+	}
+	if width <= 0 {
+		return left + " " + right
+	}
+	gap := width - lipgloss.Width(left) - lipgloss.Width(right)
+	if gap < 1 {
+		gap = 1
+	}
+	return left + strings.Repeat(" ", gap) + right
 }
 
 func (m *Model) applyDirectoryFilter(query string) {

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/sandaogouchen/nep2midsence/internal/config"
@@ -28,6 +29,7 @@ var (
 	tsCallRe = regexp.MustCompile(`((?:[A-Za-z_$][\w$]*\.)+)?([A-Za-z_$][\w$]*)\s*\(`)
 	// component prompt extraction
 	tsClassDeclRe       = regexp.MustCompile(`\bclass\s+([A-Za-z_$][\w$]*)`)
+	classExtendsRe      = regexp.MustCompile(`\bclass\s+([A-Za-z_$][\w$]*)\s+extends\s+([A-Za-z_$][\w$]*)`)
 	tsDefaultPromptHint = "DEFAULT_PROMPT"
 )
 
@@ -210,8 +212,73 @@ func extractTypeScriptFallback(filePath string, cfg *config.Config) (*types.ASTI
 		}
 	}
 
+	if matches := classExtendsRe.FindStringSubmatch(source); len(matches) == 3 {
+		astInfo.ClassName = strings.TrimSpace(matches[1])
+		astInfo.ExtendsFrom = strings.TrimSpace(matches[2])
+		astInfo.ExtendsImport = findImportedSymbolPath(astInfo.Imports, astInfo.ExtendsFrom)
+	} else if matches := tsClassDeclRe.FindStringSubmatch(source); len(matches) == 2 {
+		astInfo.ClassName = strings.TrimSpace(matches[1])
+	}
+
 	allCalls := collectTSCalls(filePath, lines, astInfo, cfg, testRanges, hookRanges)
 	return astInfo, allCalls, language, nil
+}
+
+func findImportedSymbolPath(imports []types.ImportInfo, symbol string) string {
+	symbol = strings.TrimSpace(symbol)
+	if symbol == "" {
+		return ""
+	}
+	for _, imp := range imports {
+		if importSpecIncludesSymbol(imp.Name, symbol) {
+			return imp.Path
+		}
+	}
+	return ""
+}
+
+func importSpecIncludesSymbol(importSpec string, symbol string) bool {
+	importSpec = strings.TrimSpace(importSpec)
+	symbol = strings.TrimSpace(symbol)
+	if importSpec == "" || symbol == "" {
+		return false
+	}
+
+	if !strings.HasPrefix(importSpec, "{") {
+		fields := strings.Fields(importSpec)
+		if len(fields) > 0 && fields[0] == symbol {
+			return true
+		}
+		if strings.Contains(importSpec, ",") {
+			parts := strings.Split(importSpec, ",")
+			if len(parts) > 0 && strings.TrimSpace(parts[0]) == symbol {
+				return true
+			}
+		}
+	}
+
+	if strings.Contains(importSpec, "{") {
+		start := strings.Index(importSpec, "{")
+		end := strings.LastIndex(importSpec, "}")
+		if start >= 0 && end > start {
+			items := strings.Split(importSpec[start+1:end], ",")
+			for _, item := range items {
+				item = strings.TrimSpace(item)
+				if item == "" {
+					continue
+				}
+				parts := strings.Fields(item)
+				if len(parts) == 1 && parts[0] == symbol {
+					return true
+				}
+				if len(parts) >= 3 && (parts[0] == symbol || parts[len(parts)-1] == symbol) {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
 }
 
 type tsRange struct {
@@ -499,7 +566,129 @@ func (ctx tsOwnerContext) ownerFileForRoot(root string) string {
 	if ownerFile := ctx.localImportFiles[root]; ownerFile != "" {
 		return ownerFile
 	}
+	if ownerFile := inferPageObjectFileForRoot(ctx.filePath, root); ownerFile != "" {
+		return ownerFile
+	}
 	return ""
+}
+
+func inferPageObjectFileForRoot(filePath, root string) string {
+	root = strings.TrimSpace(root)
+	if filePath == "" || root == "" {
+		return ""
+	}
+
+	baseName := upperFirst(root)
+	if !strings.HasSuffix(baseName, "Page") {
+		return ""
+	}
+
+	for _, searchRoot := range findTSPageObjectSearchRoots(filePath) {
+		candidates := scanTSFilesByBaseName([]string{searchRoot}, baseName)
+		if len(candidates) > 0 {
+			return candidates[0]
+		}
+	}
+	return ""
+}
+
+func findTSPageObjectSearchRoots(caseFilePath string) []string {
+	if caseFilePath == "" {
+		return nil
+	}
+	caseDir := filepath.Dir(caseFilePath)
+
+	var roots []string
+	seen := make(map[string]struct{})
+	add := func(p string) {
+		p = filepath.Clean(p)
+		if p == "" {
+			return
+		}
+		if _, ok := seen[p]; ok {
+			return
+		}
+		info, err := os.Stat(p)
+		if err != nil || !info.IsDir() {
+			return
+		}
+		seen[p] = struct{}{}
+		roots = append(roots, p)
+	}
+
+	cur := caseDir
+	for i := 0; i < 8; i++ {
+		add(filepath.Join(cur, "pages"))
+		add(filepath.Join(cur, "pageObjects"))
+		add(filepath.Join(cur, "pageobjects"))
+		add(filepath.Join(cur, "new_pages"))
+		if filepath.Base(cur) == "e2e" {
+			add(filepath.Join(cur, "pages"))
+			add(filepath.Join(cur, "pages", "new_pages"))
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+
+	sort.Strings(roots)
+	return roots
+}
+
+func scanTSFilesByBaseName(roots []string, baseName string) []string {
+	baseName = strings.TrimSpace(baseName)
+	if baseName == "" {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var hits []string
+	for _, root := range roots {
+		_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if d.IsDir() {
+				switch d.Name() {
+				case ".git", "node_modules", "dist":
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !isTSScriptFile(d.Name()) {
+				return nil
+			}
+			if strings.TrimSuffix(d.Name(), filepath.Ext(d.Name())) != baseName {
+				return nil
+			}
+			clean := filepath.Clean(path)
+			if _, ok := seen[clean]; ok {
+				return nil
+			}
+			seen[clean] = struct{}{}
+			hits = append(hits, clean)
+			return nil
+		})
+	}
+	sort.Strings(hits)
+	return hits
+}
+
+func isTSScriptFile(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts":
+		return true
+	default:
+		return false
+	}
+}
+
+func upperFirst(value string) string {
+	if value == "" {
+		return ""
+	}
+	return strings.ToUpper(value[:1]) + value[1:]
 }
 
 func (ctx tsOwnerContext) isKnownInfraRoot(root string) bool {

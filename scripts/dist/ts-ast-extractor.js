@@ -163,6 +163,7 @@ function callbackIsAsync(node) {
 // ── Call Collector ──────────────────────────────────────────────────────────────
 function collectCalls(node, src, sourceText) {
     const calls = [];
+    const seenBySpan = new Map();
     function walk(n) {
         let target = n;
         let awaited = false;
@@ -181,6 +182,12 @@ function collectCalls(node, src, sourceText) {
             const isWrapperCall = parts.length > 2;
             const owner = classifyOwner(fullReceiver, funcName);
             const startLine = lineOf(src, target.getStart());
+            const key = `${target.getStart()}-${target.getEnd()}-${callee}`;
+            if (seenBySpan.has(key)) {
+                const existing = calls[seenBySpan.get(key)];
+                existing.isAwait = existing.isAwait || awaited;
+                return;
+            }
             calls.push({
                 callee,
                 args: argTexts(target, src),
@@ -203,6 +210,7 @@ function collectCalls(node, src, sourceText) {
                 inFunc: "",
                 isWrapperCall,
             });
+            seenBySpan.set(key, calls.length - 1);
         }
         ts.forEachChild(n, walk);
     }
@@ -407,6 +415,49 @@ function analyseFile(filePath) {
                 doc: "",
                 receiver: "",
             });
+        }
+        if (ts.isClassDeclaration(stmt) && stmt.name) {
+            const receiver = stmt.name.text;
+            for (const member of stmt.members) {
+                if (ts.isMethodDeclaration(member) && member.name) {
+                    functions.push({
+                        name: member.name.getText(src),
+                        isAsync: isAsync(member),
+                        isExported: isExported(stmt),
+                        isTest: false,
+                        isHelper: true,
+                        testType: "",
+                        params: extractParams(member.parameters, src),
+                        startLine: lineOf(src, member.getStart()),
+                        endLine: lineOf(src, member.getEnd()),
+                        bodyText: member.body ? bodyTextOf(member.body, sourceText) : "",
+                        doc: "",
+                        receiver,
+                    });
+                    continue;
+                }
+                if (!ts.isPropertyDeclaration(member) || !member.name || !member.initializer) {
+                    continue;
+                }
+                if (!ts.isArrowFunction(member.initializer) && !ts.isFunctionExpression(member.initializer)) {
+                    continue;
+                }
+                const fn = member.initializer;
+                functions.push({
+                    name: member.name.getText(src),
+                    isAsync: isAsync(fn),
+                    isExported: isExported(stmt),
+                    isTest: false,
+                    isHelper: true,
+                    testType: "",
+                    params: extractParams(fn.parameters, src),
+                    startLine: lineOf(src, member.getStart()),
+                    endLine: lineOf(src, member.getEnd()),
+                    bodyText: fn.body ? bodyTextOf(fn.body, sourceText) : "",
+                    doc: "",
+                    receiver,
+                });
+            }
         }
         // Exported / top-level const arrow functions
         if (ts.isVariableStatement(stmt)) {

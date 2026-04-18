@@ -12,7 +12,8 @@ describe('模块名', () => {
   it('case 名称', async (params: CaseFunctionParams<'test'>) => {
     const { midscene } = params as MidsceneCaseFunctionParams;
     const { agent } = midscene!;
-
+    const campaignLogic = new SalesCreateLogic(page);
+    await campaignLogic.goToCreatePage({ advid: advid });//advid信息根据原有代码动态获取
     // 所有操作通过 agent 完成
     await agent.aiTap("点击'Sales'");
     await agent.aiInput("55", "'Daily'右侧的输入框");

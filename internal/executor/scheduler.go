@@ -79,6 +79,7 @@ func (s *Scheduler) Run(ctx context.Context, analyses []*types.FullAnalysis) []*
 
 func (s *Scheduler) executeOne(ctx context.Context, analysis *types.FullAnalysis) *types.MigrationResult {
 	result := &types.MigrationResult{
+		TaskKey:    analysis.TaskKey,
 		CaseFile:   analysis.FilePath,
 		TargetFile: analysis.TargetPath,
 	}

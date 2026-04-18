@@ -2,11 +2,13 @@ package types
 
 // FullAnalysis is the complete analysis result for a single case file
 type FullAnalysis struct {
-	FilePath     string           `json:"file_path"`
-	TargetPath   string           `json:"target_path"`
-	Package      string           `json:"package"`
-	Complexity   string           `json:"complexity"` // simple / medium / complex
-	Language     string           `json:"language,omitempty"`
+	FilePath   string `json:"file_path"`
+	TargetPath string `json:"target_path"`
+	TaskKey    string `json:"task_key,omitempty"`
+	TaskKind   string `json:"task_kind,omitempty"` // case / helper
+	Package    string `json:"package"`
+	Complexity string `json:"complexity"` // simple / medium / complex
+	Language   string `json:"language,omitempty"`
 
 	AST          *ASTInfo         `json:"ast"`
 	CallChains   []*CallChain     `json:"call_chains"`
@@ -19,18 +21,31 @@ type FullAnalysis struct {
 	// DefaultPrompts collects component-level DEFAULT_PROMPT strings (NEP-specific
 	// AI element descriptions) discovered from dependent files.
 	DefaultPrompts []DefaultPromptInfo `json:"default_prompts,omitempty"`
+
+	// HelperPlan describes a minimal helper/module migration task synthesized from
+	// case wrapper calls. It is only populated for helper tasks.
+	HelperPlan *HelperMigrationPlan `json:"helper_plan,omitempty"`
+
+	// UnresolvedHelpers lists wrapper dependencies that could not be resolved to
+	// a minimal helper migration task. Case prompts use this to preserve the
+	// original call and add TODO annotations instead of forcing whole-file helper
+	// migration.
+	UnresolvedHelpers []UnresolvedHelper `json:"unresolved_helpers,omitempty"`
 }
 
 // ASTInfo holds L1 AST structural analysis results
 type ASTInfo struct {
-	FilePath   string       `json:"file_path"`
-	Package    string       `json:"package"`
-	Imports    []ImportInfo `json:"imports"`
-	Functions  []FuncInfo   `json:"functions"`
-	Structs    []StructInfo `json:"structs"`
-	Constants  []ConstInfo  `json:"constants"`
-	Variables  []VarInfo    `json:"variables"`
-	InitBlocks []InitInfo   `json:"init_blocks"`
+	FilePath      string       `json:"file_path"`
+	Package       string       `json:"package"`
+	Imports       []ImportInfo `json:"imports"`
+	Functions     []FuncInfo   `json:"functions"`
+	Structs       []StructInfo `json:"structs"`
+	Constants     []ConstInfo  `json:"constants"`
+	Variables     []VarInfo    `json:"variables"`
+	InitBlocks    []InitInfo   `json:"init_blocks"`
+	ClassName     string       `json:"class_name,omitempty"`
+	ExtendsFrom   string       `json:"extends_from,omitempty"`
+	ExtendsImport string       `json:"extends_import,omitempty"`
 }
 
 type ImportInfo struct {
@@ -104,4 +119,16 @@ type DefaultPromptInfo struct {
 	PromptValue string `json:"prompt_value"`
 	FilePath    string `json:"file_path"`
 	Line        int    `json:"line,omitempty"`
+}
+
+type HelperMigrationPlan struct {
+	Receiver       string   `json:"receiver"`
+	PageObjectFile string   `json:"page_object_file,omitempty"`
+	Methods        []string `json:"methods,omitempty"`
+}
+
+type UnresolvedHelper struct {
+	Receiver string `json:"receiver"`
+	Method   string `json:"method"`
+	Reason   string `json:"reason"`
 }

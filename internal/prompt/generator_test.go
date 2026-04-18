@@ -298,3 +298,133 @@ func TestGenerateIncludesBusinessWrapperStepsInsideCommonIt(t *testing.T) {
 		}
 	}
 }
+
+func TestGenerateIncludesMinimalHelperMigrationScope(t *testing.T) {
+	cfg := config.DefaultConfig()
+	g := NewGenerator(cfg)
+
+	dir := t.TempDir()
+	modulePath := filepath.Join(dir, "OptimizationAndBiddingModule1MNBA.ts")
+	if err := os.WriteFile(modulePath, []byte(`export class OptimizationAndBiddingModule1MNBA {}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(module): %v", err)
+	}
+
+	analysis := &types.FullAnalysis{
+		FilePath:   modulePath,
+		TargetPath: filepath.Join(dir, "output", "OptimizationAndBiddingModule1MNBA.ts"),
+		Language:   "typescript",
+		TaskKind:   "helper",
+		HelperPlan: &types.HelperMigrationPlan{
+			Receiver:       "adGroupPage.optimizationAndBiddingModule1MNBA",
+			PageObjectFile: filepath.Join(dir, "AdGroupPage.ts"),
+			Methods:        []string{"setBid", "vv_goal_6s"},
+		},
+	}
+
+	promptText, err := g.Generate(analysis)
+	if err != nil {
+		t.Fatalf("Generate returned error: %v", err)
+	}
+	if !strings.Contains(promptText, "最小 helper 迁移范围") {
+		t.Fatalf("prompt missing minimal helper migration section: %s", promptText)
+	}
+	if !strings.Contains(promptText, "setBid") || !strings.Contains(promptText, "vv_goal_6s") {
+		t.Fatalf("prompt missing helper method list: %s", promptText)
+	}
+	if !strings.Contains(promptText, "adGroupPage.optimizationAndBiddingModule1MNBA") {
+		t.Fatalf("prompt missing helper receiver: %s", promptText)
+	}
+}
+
+func TestGenerateUsesExplicitMidsceneHelperCallsForWrapperSteps(t *testing.T) {
+	cfg := config.DefaultConfig()
+	g := NewGenerator(cfg)
+
+	dir := t.TempDir()
+	casePath := filepath.Join(dir, "case.spec.ts")
+	if err := os.WriteFile(casePath, []byte("test(\"x\", async () => {})"), 0o644); err != nil {
+		t.Fatalf("WriteFile(case): %v", err)
+	}
+
+	analysis := &types.FullAnalysis{
+		FilePath:   casePath,
+		TargetPath: filepath.Join(dir, "output", "case.spec.ts"),
+		Language:   "typescript",
+		TaskKind:   "case",
+		CallChains: []*types.CallChain{{
+			EntryFunc: "x",
+			TestFunc:  "x",
+			Steps: []types.CallStep{
+				{
+					Callee:        "listPage.commonActions.editAdGroup2",
+					FullReceiver:  "listPage.commonActions",
+					FuncName:      "editAdGroup2",
+					Args:          []string{"adgroupName", "campaignId"},
+					OwnerKind:     "business",
+					IsWrapperCall: true,
+				},
+				{
+					Callee:        "adGroupPage.optimizationAndBiddingModule1MNBA.setBid",
+					FullReceiver:  "adGroupPage.optimizationAndBiddingModule1MNBA",
+					FuncName:      "setBid",
+					Args:          []string{"\"2\""},
+					OwnerKind:     "business",
+					IsWrapperCall: true,
+				},
+			},
+		}},
+	}
+
+	promptText, err := g.Generate(analysis)
+	if err != nil {
+		t.Fatalf("Generate returned error: %v", err)
+	}
+
+	for _, want := range []string{
+		"await listPage.commonActions.editAdGroup2Midscene(agent, adgroupName, campaignId)",
+		"await adGroupPage.optimizationAndBiddingModule1MNBA.setBidMidscene(agent, \"2\")",
+	} {
+		if !strings.Contains(promptText, want) {
+			t.Fatalf("prompt missing explicit wrapper target call %q: %s", want, promptText)
+		}
+	}
+}
+
+func TestGenerateIncludesUnresolvedHelperTodoInstructions(t *testing.T) {
+	cfg := config.DefaultConfig()
+	g := NewGenerator(cfg)
+
+	dir := t.TempDir()
+	casePath := filepath.Join(dir, "case.spec.ts")
+	if err := os.WriteFile(casePath, []byte("test(\"x\", async () => {})"), 0o644); err != nil {
+		t.Fatalf("WriteFile(case): %v", err)
+	}
+
+	analysis := &types.FullAnalysis{
+		FilePath:   casePath,
+		TargetPath: filepath.Join(dir, "output", "case.spec.ts"),
+		Language:   "typescript",
+		TaskKind:   "case",
+		UnresolvedHelpers: []types.UnresolvedHelper{
+			{
+				Receiver: "adGroupPage.optimizationAndBiddingModule1MNBA",
+				Method:   "setBid",
+				Reason:   "method definition not found in module source",
+			},
+		},
+	}
+
+	promptText, err := g.Generate(analysis)
+	if err != nil {
+		t.Fatalf("Generate returned error: %v", err)
+	}
+	if !strings.Contains(promptText, "未解析 helper 依赖") {
+		t.Fatalf("prompt missing unresolved helper section: %s", promptText)
+	}
+	if !strings.Contains(promptText, "TODO(nep2midsence)") {
+		t.Fatalf("prompt missing TODO instruction for unresolved helper: %s", promptText)
+	}
+	if !strings.Contains(promptText, "setBid") {
+		t.Fatalf("prompt missing unresolved helper method name: %s", promptText)
+	}
+}

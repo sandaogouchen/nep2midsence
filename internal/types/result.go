@@ -3,12 +3,13 @@ package types
 import "time"
 
 type MigrationResult struct {
-	CaseFile   string        `json:"case_file"`
-	TargetFile string        `json:"target_file"`
-	Success    bool          `json:"success"`
-	Output     string        `json:"output"`
-	Error      string        `json:"error,omitempty"`
-	Duration   time.Duration `json:"duration"`
+	TaskKey        string        `json:"task_key,omitempty"`
+	CaseFile       string        `json:"case_file"`
+	TargetFile     string        `json:"target_file"`
+	Success        bool          `json:"success"`
+	Output         string        `json:"output"`
+	Error          string        `json:"error,omitempty"`
+	Duration       time.Duration `json:"duration"`
 	RetryCount     int           `json:"retry_count"`
 	NepFixAttempts int           `json:"nep_fix_attempts,omitempty"` // number of NEP-residual fix rounds applied
 }
@@ -25,14 +26,14 @@ type VerifyResult struct {
 }
 
 type MigrationReport struct {
-	TotalCases   int                        `json:"total_cases"`
-	Succeeded    int                        `json:"succeeded"`
-	Failed       int                        `json:"failed"`
-	Skipped      int                        `json:"skipped"`
-	SuccessRate  float64                    `json:"success_rate"`
+	TotalCases   int                         `json:"total_cases"`
+	Succeeded    int                         `json:"succeeded"`
+	Failed       int                         `json:"failed"`
+	Skipped      int                         `json:"skipped"`
+	SuccessRate  float64                     `json:"success_rate"`
 	ByComplexity map[string]*ComplexityStats `json:"by_complexity"`
-	FailedCases  []FailedCase               `json:"failed_cases"`
-	Duration     time.Duration              `json:"duration"`
+	FailedCases  []FailedCase                `json:"failed_cases"`
+	Duration     time.Duration               `json:"duration"`
 }
 
 type ComplexityStats struct {
