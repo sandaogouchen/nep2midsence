@@ -49,6 +49,37 @@ const migrationTemplate = `## 迁移任务
 
 {{end}}
 
+{{if .HelperPlan}}
+---
+
+### 3.6 最小 helper 迁移范围
+
+- 来源 receiver：` + "`" + `{{.HelperPlan.Receiver}}` + "`" + `
+- 仅迁移以下方法：
+{{range .HelperPlan.Methods -}}
+  - ` + "`" + `{{.}}` + "`" + `
+{{end}}
+{{if .HelperPlan.PageObjectFile -}}
+- 所属 page object：` + "`" + `{{.HelperPlan.PageObjectFile}}` + "`" + `
+{{end}}
+
+{{end}}
+
+{{if .UnresolvedHelpers}}
+---
+
+### 3.7 未解析 helper 依赖
+
+以下 helper 依赖未成功定位或无法最小迁移。请在 case 中保留原调用，并在对应调用前添加统一 TODO 注释。
+
+| receiver | method | reason |
+|---|---|---|
+{{range .UnresolvedHelpers -}}
+| ` + "`" + `{{.Receiver}}` + "`" + ` | ` + "`" + `{{.Method}}` + "`" + ` | {{.Reason}} |
+{{end}}
+
+{{end}}
+
 {{if .DefaultPrompts}}
 ---
 

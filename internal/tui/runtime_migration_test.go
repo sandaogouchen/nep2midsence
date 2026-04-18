@@ -3,9 +3,12 @@ package tui
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
+	"github.com/sandaogouchen/nep2midsence/internal/analyzer"
+	"github.com/sandaogouchen/nep2midsence/internal/config"
 	"github.com/sandaogouchen/nep2midsence/internal/types"
 )
 
@@ -291,5 +294,218 @@ export class AdGroupPage {
 	}
 	if !strings.Contains(joined, filepath.Clean(modPath)) {
 		t.Fatalf("deps missing module file: %v", deps)
+	}
+}
+
+func TestHelperMethodAlreadyMigratedAcceptsMidsceneSuffixPerMethod(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "helper.ts")
+	content := `
+import { agent } from 'midscene';
+
+export class OptimizationAndBiddingModule1MNBA {
+  async vv_setStandardBtnMidscene() {
+    await agent.aiTap("标准");
+  }
+
+  async legacyAction() {
+    await ai?.action("旧逻辑");
+  }
+}
+`
+	if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if !isHelperMethodAlreadyMigrated(target, "vv_setStandardBtn") {
+		t.Fatal("expected vv_setStandardBtn to be treated as migrated via Midscene suffix method")
+	}
+	if isHelperMethodAlreadyMigrated(target, "legacyAction") {
+		t.Fatal("expected legacyAction to be treated as unmigrated because method body still uses NEP")
+	}
+}
+
+func TestContainsMethodDefinitionSupportsReturnTypeAnnotations(t *testing.T) {
+	text := `
+export class CampaignBudgetRadio {
+  async click(aiOptions?: AiActionOptions): Promise<void> {
+    await super.click(aiOptions)
+  }
+}
+`
+
+	if !containsMethodDefinition(text, "click") {
+		t.Fatal("expected method definition lookup to match class methods with return type annotations")
+	}
+}
+
+func TestBuildMigrationPlanAggregatesHelperMethodsAcrossCases(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Source.Dir = dir
+	engine := analyzer.NewEngine(cfg)
+
+	e2eDir := filepath.Join(dir, "e2e")
+	caseDir := filepath.Join(e2eDir, "tests", "brand")
+	poDir := filepath.Join(e2eDir, "pages", "new_pages", "adGroupPage")
+	modDir := filepath.Join(poDir, "module", "OptimizationAndBidding")
+	if err := os.MkdirAll(caseDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(caseDir): %v", err)
+	}
+	if err := os.MkdirAll(modDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(modDir): %v", err)
+	}
+
+	poPath := filepath.Join(poDir, "AdGroupPage.ts")
+	poSource := `import { OptimizationAndBiddingModule1MNBA } from "./module/OptimizationAndBidding/OptimizationAndBiddingModule1MNBA";
+
+export class AdGroupPage {
+  public optimizationAndBiddingModule1MNBA: OptimizationAndBiddingModule1MNBA;
+}
+`
+	if err := os.WriteFile(poPath, []byte(poSource), 0o644); err != nil {
+		t.Fatalf("WriteFile(po): %v", err)
+	}
+
+	modulePath := filepath.Join(modDir, "OptimizationAndBiddingModule1MNBA.ts")
+	moduleSource := `export class OptimizationAndBiddingModule1MNBA {
+  async vv_setStandardBtn() {}
+  async vv_goal_6s() {}
+  async setBid(value: string) {}
+}
+`
+	if err := os.WriteFile(modulePath, []byte(moduleSource), 0o644); err != nil {
+		t.Fatalf("WriteFile(module): %v", err)
+	}
+
+	caseOnePath := filepath.Join(caseDir, "case-one.spec.ts")
+	caseOneSource := `test("case one", async ({ adGroupPage }) => {
+  await adGroupPage.optimizationAndBiddingModule1MNBA.vv_setStandardBtn();
+  await adGroupPage.optimizationAndBiddingModule1MNBA.vv_goal_6s();
+})`
+	if err := os.WriteFile(caseOnePath, []byte(caseOneSource), 0o644); err != nil {
+		t.Fatalf("WriteFile(caseOne): %v", err)
+	}
+
+	caseTwoPath := filepath.Join(caseDir, "case-two.spec.ts")
+	caseTwoSource := `test("case two", async ({ adGroupPage }) => {
+  await adGroupPage.optimizationAndBiddingModule1MNBA.setBid("1");
+})`
+	if err := os.WriteFile(caseTwoPath, []byte(caseTwoSource), 0o644); err != nil {
+		t.Fatalf("WriteFile(caseTwo): %v", err)
+	}
+
+	targetPath := filepath.Join(modDir, cfg.Target.OutputDir, "OptimizationAndBiddingModule1MNBA"+cfg.Target.FileSuffix+".ts")
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(targetDir): %v", err)
+	}
+	targetSource := `import { agent } from 'midscene';
+
+export class OptimizationAndBiddingModule1MNBA {
+  async vv_setStandardBtnMidscene() {
+    await agent.aiTap("标准");
+  }
+}
+`
+	if err := os.WriteFile(targetPath, []byte(targetSource), 0o644); err != nil {
+		t.Fatalf("WriteFile(target): %v", err)
+	}
+
+	analyses, err := engine.AnalyzeDir(dir)
+	if err != nil {
+		t.Fatalf("AnalyzeDir: %v", err)
+	}
+
+	plan, err := buildMigrationPlan(cfg, engine, analyses, nil)
+	if err != nil {
+		t.Fatalf("buildMigrationPlan: %v", err)
+	}
+
+	if len(plan.ToExecuteHelpers) != 1 {
+		t.Fatalf("helper task count = %d, want 1", len(plan.ToExecuteHelpers))
+	}
+
+	helper := plan.ToExecuteHelpers[0]
+	if helper.FilePath != modulePath {
+		t.Fatalf("helper source = %q, want %q", helper.FilePath, modulePath)
+	}
+	if helper.HelperPlan == nil {
+		t.Fatal("expected helper plan metadata on helper task")
+	}
+	gotMethods := append([]string(nil), helper.HelperPlan.Methods...)
+	sort.Strings(gotMethods)
+	wantMethods := []string{"setBid", "vv_goal_6s"}
+	if strings.Join(gotMethods, ",") != strings.Join(wantMethods, ",") {
+		t.Fatalf("helper methods = %v, want %v", gotMethods, wantMethods)
+	}
+}
+
+func TestBuildMigrationPlanMarksUnresolvedHelperMethodsOnCases(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Source.Dir = dir
+	engine := analyzer.NewEngine(cfg)
+
+	e2eDir := filepath.Join(dir, "e2e")
+	caseDir := filepath.Join(e2eDir, "tests", "brand")
+	poDir := filepath.Join(e2eDir, "pages", "new_pages", "adGroupPage")
+	modDir := filepath.Join(poDir, "module", "OptimizationAndBidding")
+	if err := os.MkdirAll(caseDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(caseDir): %v", err)
+	}
+	if err := os.MkdirAll(modDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(modDir): %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(poDir, "AdGroupPage.ts"), []byte(`import { OptimizationAndBiddingModule1MNBA } from "./module/OptimizationAndBidding/OptimizationAndBiddingModule1MNBA";
+export class AdGroupPage {
+  public optimizationAndBiddingModule1MNBA: OptimizationAndBiddingModule1MNBA;
+}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(po): %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(modDir, "OptimizationAndBiddingModule1MNBA.ts"), []byte(`export class OptimizationAndBiddingModule1MNBA {
+  async vv_setStandardBtn() {}
+}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(module): %v", err)
+	}
+
+	casePath := filepath.Join(caseDir, "case.spec.ts")
+	caseSource := `test("case", async ({ adGroupPage }) => {
+  await adGroupPage.optimizationAndBiddingModule1MNBA.setBid("1");
+})`
+	if err := os.WriteFile(casePath, []byte(caseSource), 0o644); err != nil {
+		t.Fatalf("WriteFile(case): %v", err)
+	}
+
+	analyses, err := engine.AnalyzeDir(dir)
+	if err != nil {
+		t.Fatalf("AnalyzeDir: %v", err)
+	}
+
+	plan, err := buildMigrationPlan(cfg, engine, analyses, nil)
+	if err != nil {
+		t.Fatalf("buildMigrationPlan: %v", err)
+	}
+
+	if len(plan.ToExecuteHelpers) != 0 {
+		t.Fatalf("helper task count = %d, want 0 for unresolved-only receiver", len(plan.ToExecuteHelpers))
+	}
+	if len(plan.ToExecuteCases) != 1 {
+		t.Fatalf("case task count = %d, want 1", len(plan.ToExecuteCases))
+	}
+	caseAnalysis := plan.ToExecuteCases[0]
+	if len(caseAnalysis.UnresolvedHelpers) != 1 {
+		t.Fatalf("unresolved helper count = %d, want 1", len(caseAnalysis.UnresolvedHelpers))
+	}
+	got := caseAnalysis.UnresolvedHelpers[0]
+	if got.Receiver != "adGroupPage.optimizationAndBiddingModule1MNBA" {
+		t.Fatalf("receiver = %q, want %q", got.Receiver, "adGroupPage.optimizationAndBiddingModule1MNBA")
+	}
+	if got.Method != "setBid" {
+		t.Fatalf("method = %q, want %q", got.Method, "setBid")
+	}
+	if got.Reason == "" {
+		t.Fatal("expected unresolved helper reason to be populated")
 	}
 }

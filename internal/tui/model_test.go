@@ -109,19 +109,25 @@ func TestModelSmokeViewDoesNotPanic(t *testing.T) {
 	_ = model.View()
 }
 
-func TestModelViewRendersBorderedCommandInput(t *testing.T) {
+func TestModelViewRendersCompactCommandBar(t *testing.T) {
 	model := NewModel(config.DefaultConfig(), NewNoopRuntime(), Options{})
 
 	view := model.View()
 
-	if !strings.Contains(view, "Command Input") {
-		t.Fatal("view missing command input title")
+	if !strings.Contains(view, "Command") {
+		t.Fatal("view missing command label")
 	}
-	if !strings.Contains(view, "Type a slash command like /help or /start") {
-		t.Fatal("view missing command input hint")
+	if !strings.Contains(view, "/help") {
+		t.Fatal("view missing slash command hint")
 	}
-	if !strings.Contains(view, "┌") || !strings.Contains(view, "┐") {
-		t.Fatal("view missing bordered command input frame")
+	if strings.Contains(view, "Command Input") {
+		t.Fatal("view should not render legacy command input title")
+	}
+	if strings.Contains(view, "Type a slash command like /help or /start") {
+		t.Fatal("view should not render legacy command input helper copy")
+	}
+	if strings.Contains(view, "┌") || strings.Contains(view, "┐") {
+		t.Fatal("view should not render legacy bordered command frame")
 	}
 }
 
@@ -266,6 +272,34 @@ func TestRuntimeEventAppendsStructuredLogLines(t *testing.T) {
 	}
 }
 
+func TestRuntimeEventKeepsExistingProgressWhenEventOmitsCounts(t *testing.T) {
+	model := NewModel(config.DefaultConfig(), NewNoopRuntime(), Options{})
+
+	next, _ := model.Update(runtimeEventMsg{event: WorkflowEvent{
+		Stage:     "generate",
+		Total:     9,
+		Successes: 2,
+		Failures:  1,
+	}})
+	updated := next.(Model)
+
+	next, _ = updated.Update(runtimeEventMsg{event: WorkflowEvent{
+		Stage:   "execute",
+		Message: "开始执行迁移",
+	}})
+	updated = next.(Model)
+
+	if updated.progressTotal != 9 {
+		t.Fatalf("progressTotal = %d, want 9", updated.progressTotal)
+	}
+	if updated.successes != 2 {
+		t.Fatalf("successes = %d, want 2", updated.successes)
+	}
+	if updated.failures != 1 {
+		t.Fatalf("failures = %d, want 1", updated.failures)
+	}
+}
+
 func TestRunningViewSupportsLogScrolling(t *testing.T) {
 	model := NewModel(config.DefaultConfig(), NewNoopRuntime(), Options{})
 	model.activeView = viewRunning
@@ -297,6 +331,45 @@ func TestRunningViewSupportsLogScrolling(t *testing.T) {
 	updated = next.(Model)
 	if updated.logScroll != initialScroll {
 		t.Fatalf("logScroll after end = %d, want %d", updated.logScroll, initialScroll)
+	}
+}
+
+func TestRunningViewRendersStreamingLogsAndShiftStats(t *testing.T) {
+	model := NewModel(config.DefaultConfig(), NewNoopRuntime(), Options{})
+	model.activeView = viewRunning
+	model.width = 120
+	model.height = 24
+	model.currentStage = "execute"
+	model.currentFile = "/tmp/case-a.ts"
+	model.progressCurrent = 7
+	model.progressTotal = 12
+	model.successes = 5
+	model.failures = 2
+	model.logs = []string{
+		"[成功] case-a.ts",
+		"coco> wrote target file",
+		"coco> shift completed",
+	}
+
+	view := model.View()
+
+	if !strings.Contains(view, "Planned 12") {
+		t.Fatal("running view missing planned count")
+	}
+	if !strings.Contains(view, "Shifted 5") {
+		t.Fatal("running view missing shifted count")
+	}
+	if !strings.Contains(view, "Failed 2") {
+		t.Fatal("running view missing failed count")
+	}
+	if !strings.Contains(view, "[成功] case-a.ts") || !strings.Contains(view, "coco> shift completed") {
+		t.Fatal("running view missing streamed log lines")
+	}
+	if strings.Contains(view, "日志 3 行") {
+		t.Fatal("running view should not render legacy log box title")
+	}
+	if strings.Contains(view, "┌") || strings.Contains(view, "┐") {
+		t.Fatal("running view should not render bordered log box")
 	}
 }
 

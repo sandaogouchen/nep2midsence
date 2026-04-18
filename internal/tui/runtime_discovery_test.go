@@ -100,6 +100,53 @@ export class CampaignPage {
 	}
 }
 
+func TestResolveModuleFileFromPropertySupportsDefiniteAssignmentTypes(t *testing.T) {
+	dir := t.TempDir()
+
+	moduleFile := filepath.Join(dir, "e2e", "pages", "new_pages", "campaignPage", "module", "CampaignNameModule", "CampaignNameModule.ts")
+	if err := os.MkdirAll(filepath.Dir(moduleFile), 0o755); err != nil {
+		t.Fatalf("MkdirAll(module): %v", err)
+	}
+	if err := os.WriteFile(moduleFile, []byte("export class CampaignNameModule {}"), 0o644); err != nil {
+		t.Fatalf("WriteFile(module): %v", err)
+	}
+
+	pageFile := filepath.Join(dir, "e2e", "pages", "new_pages", "campaignPage", "CampaignPage.ts")
+	if err := os.MkdirAll(filepath.Dir(pageFile), 0o755); err != nil {
+		t.Fatalf("MkdirAll(page): %v", err)
+	}
+	pageSource := `import { CampaignNameModule } from "@pages/new_pages/campaignPage/module/CampaignNameModule/CampaignNameModule";
+
+export class CampaignPage {
+  campaignNameModule!: CampaignNameModule;
+}`
+	if err := os.WriteFile(pageFile, []byte(pageSource), 0o644); err != nil {
+		t.Fatalf("WriteFile(page): %v", err)
+	}
+
+	tsconfigPath := filepath.Join(dir, "tsconfig.json")
+	if err := os.WriteFile(tsconfigPath, []byte(`{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@pages/*": ["./e2e/pages/*"]
+    }
+  }
+}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(tsconfig): %v", err)
+	}
+
+	tscp, err := config.LoadTsConfig(tsconfigPath)
+	if err != nil {
+		t.Fatalf("LoadTsConfig: %v", err)
+	}
+
+	got := resolveModuleFileFromProperty(pageFile, "campaignNameModule", tscp)
+	if got != moduleFile {
+		t.Fatalf("resolveModuleFileFromProperty() = %q, want %q", got, moduleFile)
+	}
+}
+
 func TestScanExtendedDirectoriesIncludesInheritedNepFiles(t *testing.T) {
 	dir := t.TempDir()
 

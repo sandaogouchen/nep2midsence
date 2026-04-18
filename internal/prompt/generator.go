@@ -24,25 +24,28 @@ type Generator struct {
 
 // PromptData holds all data needed to render a migration prompt
 type PromptData struct {
-	MigrationDoc   string
-	SourceFile     string
-	TargetFile     string
-	RelatedFiles   []string
-	ReferenceDocs  []string
-	APIMappings    []MappingEntry
-	OperationSteps []OperationStep
-	DefaultPrompts []DefaultPromptEntry
-	DataFlows      []DataFlowEntry
-	Patterns       []PatternEntry
-	StepIntents    []IntentEntry
-	CodeFenceLang  string
-	TargetDir      string
-	Constraints    []string
-	ExampleBefore  string
-	ExampleAfter   string
-	IsCrossRepo    bool
-	SourceRepoRoot string
-	TargetRepoRoot string
+	MigrationDoc      string
+	SourceFile        string
+	TargetFile        string
+	TaskKind          string
+	RelatedFiles      []string
+	ReferenceDocs     []string
+	APIMappings       []MappingEntry
+	OperationSteps    []OperationStep
+	HelperPlan        *HelperPlanEntry
+	UnresolvedHelpers []UnresolvedHelperEntry
+	DefaultPrompts    []DefaultPromptEntry
+	DataFlows         []DataFlowEntry
+	Patterns          []PatternEntry
+	StepIntents       []IntentEntry
+	CodeFenceLang     string
+	TargetDir         string
+	Constraints       []string
+	ExampleBefore     string
+	ExampleAfter      string
+	IsCrossRepo       bool
+	SourceRepoRoot    string
+	TargetRepoRoot    string
 }
 
 type MappingEntry struct {
@@ -57,6 +60,18 @@ type OperationStep struct {
 	Intent       string
 	NepCall      string
 	MidsceneCall string
+}
+
+type HelperPlanEntry struct {
+	Receiver       string
+	PageObjectFile string
+	Methods        []string
+}
+
+type UnresolvedHelperEntry struct {
+	Receiver string
+	Method   string
+	Reason   string
 }
 
 type DefaultPromptEntry struct {
@@ -148,6 +163,7 @@ func (g *Generator) buildPromptData(analysis *types.FullAnalysis) *PromptData {
 		MigrationDoc:  g.migrationDoc,
 		SourceFile:    analysis.FilePath,
 		TargetFile:    analysis.TargetPath,
+		TaskKind:      analysis.TaskKind,
 		CodeFenceLang: detectCodeFenceLanguage(analysis.FilePath, analysis.Language),
 	}
 
@@ -203,7 +219,7 @@ func (g *Generator) buildPromptData(analysis *types.FullAnalysis) *PromptData {
 			if step.MigrationRule != nil {
 				midsceneCall = step.MigrationRule.MidsceneEquivalent
 			} else if stepType == "封装方法" {
-				midsceneCall = "（需新建 Midscene 版本的重写函数，不要修改原函数；case 中改为调用新函数）"
+				midsceneCall = buildWrapperMidsceneCall(step)
 			}
 
 			intent := strings.TrimSpace(intentByStepIndex[localIdx])
@@ -225,6 +241,22 @@ func (g *Generator) buildPromptData(analysis *types.FullAnalysis) *PromptData {
 			})
 			stepIdx++
 		}
+	}
+
+	// Build DEFAULT_PROMPT entries (filled when analysis.DefaultPrompts is present)
+	if analysis.HelperPlan != nil {
+		data.HelperPlan = &HelperPlanEntry{
+			Receiver:       analysis.HelperPlan.Receiver,
+			PageObjectFile: analysis.HelperPlan.PageObjectFile,
+			Methods:        append([]string(nil), analysis.HelperPlan.Methods...),
+		}
+	}
+	for _, item := range analysis.UnresolvedHelpers {
+		data.UnresolvedHelpers = append(data.UnresolvedHelpers, UnresolvedHelperEntry{
+			Receiver: item.Receiver,
+			Method:   item.Method,
+			Reason:   item.Reason,
+		})
 	}
 
 	// Build DEFAULT_PROMPT entries (filled when analysis.DefaultPrompts is present)
@@ -297,6 +329,18 @@ func (g *Generator) buildPromptData(analysis *types.FullAnalysis) *PromptData {
 		"不要修改原始文件",
 		"迁移完成后检查代码是否有语法错误",
 	}
+	if data.HelperPlan != nil {
+		data.Constraints = append(data.Constraints,
+			fmt.Sprintf("这是一个 helper 最小迁移任务：仅迁移以下方法，不要整文件补齐其它无关逻辑：%s", strings.Join(data.HelperPlan.Methods, ", ")),
+			"保持原文件骨架和已有代码，仅补充这些方法所需的最小 import、字段和实例化依赖",
+		)
+	}
+	if len(data.UnresolvedHelpers) > 0 {
+		for _, item := range data.UnresolvedHelpers {
+			data.Constraints = append(data.Constraints,
+				fmt.Sprintf("未解析 helper 依赖：保留原调用，并在调用前添加 TODO 注释：// TODO(nep2midsence): helper dependency not migrated: %s.%s；原因：%s", item.Receiver, item.Method, item.Reason))
+		}
+	}
 
 	// Cross-repo mode: inject additional constraints
 	if g.cfg.IsCrossRepo() {
@@ -331,6 +375,35 @@ func uniqueNonEmpty(items []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func buildWrapperMidsceneCall(step types.CallStep) string {
+	receiver := strings.TrimSpace(step.FullReceiver)
+	method := strings.TrimSpace(step.FuncName)
+	if receiver == "" {
+		receiver = strings.TrimSpace(step.Receiver)
+	}
+	if method == "" {
+		method = lastIdent(step.Callee)
+	}
+	if receiver == "" || method == "" {
+		return "（需新建 Midscene 版本的重写函数，不要修改原函数；case 中改为调用新函数）"
+	}
+	if !strings.HasSuffix(method, "Midscene") {
+		method += "Midscene"
+	}
+
+	args := append([]string{"agent"}, step.Args...)
+	return fmt.Sprintf("await %s.%s(%s)", receiver, method, strings.Join(args, ", "))
+}
+
+func lastIdent(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	parts := strings.Split(value, ".")
+	return strings.TrimSpace(parts[len(parts)-1])
 }
 
 func detectCodeFenceLanguage(filePath, language string) string {

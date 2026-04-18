@@ -12,8 +12,9 @@ import (
 
 const stateFileName = ".nep2midsence-state.json"
 
-// TaskSnapshot captures the persisted state of a single migrated file.
+// TaskSnapshot captures the persisted state of a single migration task.
 type TaskSnapshot struct {
+	TaskKey    string    `json:"task_key,omitempty"`
 	File       string    `json:"file"`
 	TargetFile string    `json:"target_file,omitempty"`
 	Kind       string    `json:"kind,omitempty"`        // case | helper
@@ -99,7 +100,7 @@ func (s *StateStore) StartRun(runID, dir, targetBaseDir string, totalFiles int, 
 }
 
 // RecordTaskResult updates the active run with a completed task result.
-func (s *StateStore) RecordTaskResult(runID, file, status, errMsg, kind, sourceHash, targetFile string, updatedAt time.Time) error {
+func (s *StateStore) RecordTaskResult(runID, taskKey, file, status, errMsg, kind, sourceHash, targetFile string, updatedAt time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -112,7 +113,8 @@ func (s *StateStore) RecordTaskResult(runID, file, status, errMsg, kind, sourceH
 
 	replaced := false
 	for i := range run.Tasks {
-		if run.Tasks[i].File == file {
+		if taskSnapshotMatches(run.Tasks[i], taskKey, file) {
+			run.Tasks[i].TaskKey = taskKey
 			run.Tasks[i].Status = status
 			run.Tasks[i].Error = errMsg
 			run.Tasks[i].Kind = kind
@@ -125,6 +127,7 @@ func (s *StateStore) RecordTaskResult(runID, file, status, errMsg, kind, sourceH
 	}
 	if !replaced {
 		run.Tasks = append(run.Tasks, TaskSnapshot{
+			TaskKey:    taskKey,
 			File:       file,
 			TargetFile: targetFile,
 			Kind:       kind,
@@ -148,15 +151,15 @@ func (s *StateStore) RecordTaskResult(runID, file, status, errMsg, kind, sourceH
 	return s.saveLocked()
 }
 
-// LatestCompletedTask returns the most recent completed/skipped task for the file.
-func (s *StateStore) LatestCompletedTask(file string) *TaskSnapshot {
+// LatestCompletedTask returns the most recent completed/skipped task for the task key.
+func (s *StateStore) LatestCompletedTask(taskKey string) *TaskSnapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for i := len(s.state.Runs) - 1; i >= 0; i-- {
 		run := s.state.Runs[i]
 		for j := len(run.Tasks) - 1; j >= 0; j-- {
 			t := run.Tasks[j]
-			if t.File != file {
+			if !taskSnapshotMatches(t, taskKey, taskKey) {
 				continue
 			}
 			if t.Status == "completed" || t.Status == "skipped" {
@@ -170,11 +173,11 @@ func (s *StateStore) LatestCompletedTask(file string) *TaskSnapshot {
 
 // IsUpToDate reports whether the file has been migrated and the source hash is unchanged.
 // If targetFile is non-empty, it must exist on disk.
-func (s *StateStore) IsUpToDate(file, sourceHash, targetFile string) bool {
-	if strings.TrimSpace(file) == "" || strings.TrimSpace(sourceHash) == "" {
+func (s *StateStore) IsUpToDate(taskKey, sourceHash, targetFile string) bool {
+	if strings.TrimSpace(taskKey) == "" || strings.TrimSpace(sourceHash) == "" {
 		return false
 	}
-	latest := s.LatestCompletedTask(file)
+	latest := s.LatestCompletedTask(taskKey)
 	if latest == nil {
 		return false
 	}
@@ -187,6 +190,17 @@ func (s *StateStore) IsUpToDate(file, sourceHash, targetFile string) bool {
 		}
 	}
 	return true
+}
+
+func taskSnapshotMatches(snapshot TaskSnapshot, taskKey string, fallbackFile string) bool {
+	taskKey = strings.TrimSpace(taskKey)
+	if taskKey != "" {
+		if strings.TrimSpace(snapshot.TaskKey) != "" {
+			return snapshot.TaskKey == taskKey
+		}
+		return snapshot.File == fallbackFile
+	}
+	return snapshot.File == fallbackFile
 }
 
 // CompleteRun marks the run as finished.

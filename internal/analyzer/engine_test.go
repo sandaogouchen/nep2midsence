@@ -334,6 +334,94 @@ func TestAnalyzeFileClassifiesBusinessWrappersInsideCommonIt(t *testing.T) {
 	assertWrapper("adGroupPage.optimizationAndBiddingModule1MNBA.vv_setAfterViewBtn")
 }
 
+func TestAnalyzeFileInfersOwnerFilesForCommonItFixturePages(t *testing.T) {
+	cfg := config.DefaultConfig()
+	engine := NewEngine(cfg)
+
+	dir := t.TempDir()
+	e2eDir := filepath.Join(dir, "e2e")
+	casePath := filepath.Join(e2eDir, "tests", "new_tests", "brand", "video-view", "sample.spec.ts")
+	campaignPagePath := filepath.Join(e2eDir, "pages", "new_pages", "campaignPage", "CampaignPage.ts")
+	adGroupPagePath := filepath.Join(e2eDir, "pages", "new_pages", "adGroupPage", "AdGroupPage.ts")
+	if err := os.MkdirAll(filepath.Dir(casePath), 0o755); err != nil {
+		t.Fatalf("mkdir case dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(campaignPagePath), 0o755); err != nil {
+		t.Fatalf("mkdir campaign page dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(adGroupPagePath), 0o755); err != nil {
+		t.Fatalf("mkdir adgroup page dir: %v", err)
+	}
+	if err := os.WriteFile(campaignPagePath, []byte(`export class CampaignPage {}`), 0o644); err != nil {
+		t.Fatalf("write campaign page: %v", err)
+	}
+	if err := os.WriteFile(adGroupPagePath, []byte(`export class AdGroupPage {}`), 0o644); err != nil {
+		t.Fatalf("write adgroup page: %v", err)
+	}
+	caseSource := `import { commonIt } from "@utils/nep_utils/CommonIt/CommonIt"
+
+describe("x", () => {
+  it("case", commonIt("mock-url", async ({ campaignPage, adGroupPage }) => {
+    await campaignPage.campaignNameModule.setCampaignName("demo");
+    await adGroupPage.optimizationAndBiddingModule1MNBA.setBid("1");
+  }))
+})
+`
+	if err := os.WriteFile(casePath, []byte(caseSource), 0o644); err != nil {
+		t.Fatalf("write case file: %v", err)
+	}
+
+	result, err := engine.AnalyzeFile(casePath)
+	if err != nil {
+		t.Fatalf("AnalyzeFile returned error: %v", err)
+	}
+
+	assertOwnerFile := func(callee, want string) {
+		t.Helper()
+		for _, st := range flattenCallSteps(result) {
+			if st.Callee == callee {
+				if st.OwnerFile != want {
+					t.Fatalf("%s OwnerFile = %q, want %q", callee, st.OwnerFile, want)
+				}
+				return
+			}
+		}
+		t.Fatalf("did not find step %q", callee)
+	}
+
+	assertOwnerFile("campaignPage.campaignNameModule.setCampaignName", campaignPagePath)
+	assertOwnerFile("adGroupPage.optimizationAndBiddingModule1MNBA.setBid", adGroupPagePath)
+}
+
+func TestAnalyzeFileDeduplicatesAwaitedCalls(t *testing.T) {
+	cfg := config.DefaultConfig()
+	engine := NewEngine(cfg)
+
+	dir := t.TempDir()
+	casePath := filepath.Join(dir, "sample.spec.ts")
+	caseSource := `test("awaited call", async () => {
+  await listPage.commonActions.editAdGroup2("adgroup", "cid");
+})`
+	if err := os.WriteFile(casePath, []byte(caseSource), 0o644); err != nil {
+		t.Fatalf("write case file: %v", err)
+	}
+
+	result, err := engine.AnalyzeFile(casePath)
+	if err != nil {
+		t.Fatalf("AnalyzeFile returned error: %v", err)
+	}
+
+	count := 0
+	for _, st := range flattenCallSteps(result) {
+		if st.Callee == "listPage.commonActions.editAdGroup2" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("awaited wrapper call count = %d, want 1", count)
+	}
+}
+
 func flattenCallSteps(result *types.FullAnalysis) []types.CallStep {
 	var steps []types.CallStep
 	if result == nil {
