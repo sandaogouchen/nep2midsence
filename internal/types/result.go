@@ -9,7 +9,8 @@ type MigrationResult struct {
 	Output     string        `json:"output"`
 	Error      string        `json:"error,omitempty"`
 	Duration   time.Duration `json:"duration"`
-	RetryCount int           `json:"retry_count"`
+	RetryCount     int           `json:"retry_count"`
+	NepFixAttempts int           `json:"nep_fix_attempts,omitempty"` // number of NEP-residual fix rounds applied
 }
 
 type VerifyResult struct {
