@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -229,6 +230,23 @@ func TestDirectoryPickerKeepsListNavigationAfterSearch(t *testing.T) {
 	}
 }
 
+func TestTargetDirectoryPickerStartsFromParentOfWorkDirAndIgnoresConfig(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Target.BaseDir = "/should/not/be/used"
+
+	model := NewModel(cfg, &countingRuntime{}, Options{
+		WorkDir: "/Users/bytedance/tt4b_ai_e2e/",
+	})
+
+	next, _ := model.openTargetDirectoryPicker()
+	updated := next.(Model)
+
+	want := filepath.Clean("/Users/bytedance")
+	if updated.targetBrowsePath != want {
+		t.Fatalf("targetBrowsePath = %q, want %q", updated.targetBrowsePath, want)
+	}
+}
+
 func TestDirectoryPickerMatchesPathTokensAcrossNestedDirectories(t *testing.T) {
 	runtime := &countingRuntime{
 		dirs: []string{
@@ -272,8 +290,11 @@ func TestRuntimeEventAppendsStructuredLogLines(t *testing.T) {
 	}
 }
 
-func TestRuntimeEventKeepsExistingProgressWhenEventOmitsCounts(t *testing.T) {
+func TestRuntimeEventResetsCurrentProgressWhenStageChangesWithNewTotal(t *testing.T) {
 	model := NewModel(config.DefaultConfig(), NewNoopRuntime(), Options{})
+	model.currentStage = "analyze"
+	model.progressCurrent = 27
+	model.progressTotal = 42
 
 	next, _ := model.Update(runtimeEventMsg{event: WorkflowEvent{
 		Stage:     "generate",
@@ -283,14 +304,24 @@ func TestRuntimeEventKeepsExistingProgressWhenEventOmitsCounts(t *testing.T) {
 	}})
 	updated := next.(Model)
 
+	if updated.progressCurrent != 0 {
+		t.Fatalf("progressCurrent = %d, want 0 after stage change", updated.progressCurrent)
+	}
+	if updated.progressTotal != 9 {
+		t.Fatalf("progressTotal = %d, want 9", updated.progressTotal)
+	}
+
 	next, _ = updated.Update(runtimeEventMsg{event: WorkflowEvent{
 		Stage:   "execute",
 		Message: "开始执行迁移",
 	}})
 	updated = next.(Model)
 
+	if updated.progressCurrent != 0 {
+		t.Fatalf("progressCurrent after execute start = %d, want 0", updated.progressCurrent)
+	}
 	if updated.progressTotal != 9 {
-		t.Fatalf("progressTotal = %d, want 9", updated.progressTotal)
+		t.Fatalf("progressTotal after execute start = %d, want 9", updated.progressTotal)
 	}
 	if updated.successes != 2 {
 		t.Fatalf("successes = %d, want 2", updated.successes)
@@ -370,6 +401,33 @@ func TestRunningViewRendersStreamingLogsAndShiftStats(t *testing.T) {
 	}
 	if strings.Contains(view, "┌") || strings.Contains(view, "┐") {
 		t.Fatal("running view should not render bordered log box")
+	}
+}
+
+func TestRunningViewRendersAnalyzeProgressAndCurrentFile(t *testing.T) {
+	model := NewModel(config.DefaultConfig(), NewNoopRuntime(), Options{})
+	model.activeView = viewRunning
+	model.width = 100
+	model.height = 20
+
+	next, _ := model.Update(runtimeEventMsg{event: WorkflowEvent{
+		Stage:       "analyze",
+		Message:     "分析目录结构",
+		Current:     2,
+		Total:       5,
+		CurrentFile: "/tmp/source/case-b.spec.ts",
+	}})
+	updated := next.(Model)
+
+	view := updated.View()
+	if !strings.Contains(view, "2/5") {
+		t.Fatal("running view missing analyze progress summary")
+	}
+	if !strings.Contains(view, "/tmp/source/case-b.spec.ts") {
+		t.Fatal("running view missing analyze current file")
+	}
+	if !strings.Contains(view, "ANALYZE") {
+		t.Fatal("running view missing analyze stage label")
 	}
 }
 

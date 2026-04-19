@@ -40,6 +40,12 @@ type tsFuncEntry struct {
 	EndLine   int      `json:"endLine"`
 	Doc       string   `json:"doc,omitempty"`
 	Receiver  string   `json:"receiver,omitempty"`
+
+	// Wrapper fields from TS extractor
+	WrapperName           string   `json:"wrapperName,omitempty"`
+	WrapperInjectedParams []string `json:"wrapperInjectedParams,omitempty"`
+	WrapperOptions        string   `json:"wrapperOptions,omitempty"`
+	WrapperUrl            string   `json:"wrapperUrl,omitempty"`
 }
 
 type tsCallEntry struct {
@@ -172,6 +178,12 @@ func (b *TSBridge) ConvertToASTInfo(r TSExtractResult) *types.ASTInfo {
 			LineEnd:   fn.EndLine,
 			Doc:       fn.Doc,
 			Receiver:  fn.Receiver,
+
+			// Map wrapper fields from TS extractor
+			WrapperName:           fn.WrapperName,
+			WrapperInjectedParams: fn.WrapperInjectedParams,
+			WrapperOptions:        fn.WrapperOptions,
+			WrapperUrl:            fn.WrapperUrl,
 		}
 		// Convert string params to ParamInfo
 		for _, p := range fn.Params {

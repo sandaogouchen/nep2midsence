@@ -70,12 +70,12 @@ const migrationTemplate = `## 迁移任务
 
 ### 3.7 未解析 helper 依赖
 
-以下 helper 依赖未成功定位或无法最小迁移。请在 case 中保留原调用，并在对应调用前添加统一 TODO 注释。
+以下 helper 依赖未成功定位或无法最小迁移，已按 receiver 可达性分类处理：
 
-| receiver | method | reason |
-|---|---|---|
+| receiver | method | reason | 可达性 | 策略 |
+|---|---|---|---|---|
 {{range .UnresolvedHelpers -}}
-| ` + "`" + `{{.Receiver}}` + "`" + ` | ` + "`" + `{{.Method}}` + "`" + ` | {{.Reason}} |
+| ` + "`" + `{{.Receiver}}` + "`" + ` | ` + "`" + `{{.Method}}` + "`" + ` | {{.Reason}} | {{if .ReceiverReachable}}可达{{else}}不可达{{end}} | {{if .ReceiverReachable}}新建 Midscene 版本{{else}}保留原调用+TODO{{end}} |
 {{end}}
 
 {{end}}
@@ -144,6 +144,38 @@ const migrationTemplate = `## 迁移任务
 {{end}}
 {{end}}
 
+{{if .LocalImportDeps}}
+#### 6.3 源仓库本地依赖 import（跨仓库时不得直接原样保留）
+
+| import path | 当前文件实际引用 | 源文件 |
+|---|---|---|
+{{range .LocalImportDeps -}}
+| ` + "`" + `{{.ImportPath}}` + "`" + ` | ` + "`" + `{{.ImportSpec}}` + "`" + ` | ` + "`" + `{{.SourceFile}}` + "`" + ` |
+{{end}}
+
+请优先 Read 上述源文件；若目标仓库没有同名模块，不要继续保留这些 import，必须改为目标仓库内可解析的实现（最小化内联或改写为本地依赖）。
+
+**注意**：表中 SourceFile 标记为 "(unresolved alias ...)" 的行表示该 alias 在目标仓库无法解析，必须内联或改写。
+{{end}}
+
+{{if .SharedSymbolDeps}}
+#### 6.4 共享符号依赖（禁止在 case 内重定义）
+
+以下符号已经被识别为共享依赖。迁移时必须保留为 import，不得在 case 内重新声明同名 ` + "`" + `const` + "`" + ` / ` + "`" + `enum` + "`" + ` / ` + "`" + `function` + "`" + ` / noop stub：
+
+| symbol | source import | import spec | concrete export file | target dependency file | kind |
+|---|---|---|---|---|---|
+{{range .SharedSymbolDeps -}}
+| ` + "`" + `{{.ImportedName}}` + "`" + ` | ` + "`" + `{{.ImportPath}}` + "`" + ` | ` + "`" + `{{.ImportSpec}}` + "`" + ` | ` + "`" + `{{.ExportFile}}` + "`" + ` | ` + "`" + `{{.TargetFile}}` + "`" + ` | ` + "`" + `{{.DependencyKind}}` + "`" + ` |
+{{end}}
+
+处理要求：
+
+- 禁止在 case 内重定义上述共享符号
+- 必须从迁移后的目标依赖文件 import
+- 若源仓库通过 barrel re-export 暴露该符号，迁移后应指向 concrete migrated dependency，而不是继续依赖不可解析的源仓库 alias
+{{end}}
+
 {{if .ExampleBefore}}
 ---
 
@@ -158,6 +190,23 @@ const migrationTemplate = `## 迁移任务
 ` + "```" + `{{.CodeFenceLang}}
 {{.ExampleAfter}}
 ` + "```" + `
+{{end}}
+
+{{if .HasCommonItWrapper}}
+---
+
+### 7.5 commonIt Wrapper 约束
+
+本 case 使用了 commonIt wrapper 封装，以下参数由 wrapper 自动注入，**不是真实 import 依赖**：
+
+- **Wrapper 注入的参数**：page, midscene{{range .WrapperInjectedPageObjects}}, ` + "`" + `{{.}}` + "`" + `{{end}}
+{{if .WrapperUrl}}- **Wrapper 自动导航 URL**：` + "`" + `{{.WrapperUrl}}` + "`" + ` — 迁移后需要在 test body 中显式调用 ` + "`" + `agent.aiAction("navigate to " + url)` + "`" + ` 或使用 ` + "`" + `page.goto(url)` + "`" + `{{end}}
+
+**迁移规则**：
+1. 将 commonIt 替换为标准 ` + "`" + `it` + "`" + ` / ` + "`" + `test` + "`" + `，回调签名改为 ` + "`" + `CaseFunctionParams<'test'>` + "`" + `，仅接收 ` + "`" + `{ page, midscene }` + "`" + `
+2. Wrapper 注入的 Page Object 实例（如 {{range .WrapperInjectedPageObjects}}` + "`" + `{{.}}` + "`" + ` {{end}}）需在 test body 内自行 new 或从 import 获取
+3. Wrapper 自动执行的 URL 导航需在 test body 开头显式补上
+4. 删除对 commonIt wrapper 的 import
 {{end}}
 
 ---

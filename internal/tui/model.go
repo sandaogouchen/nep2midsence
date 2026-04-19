@@ -241,11 +241,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.commandInput, cmd = m.commandInput.Update(msg)
 		return m, cmd
 	case runtimeEventMsg:
+		prevStage := m.currentStage
 		m.currentStage = msg.event.Stage
 		if msg.event.Current > 0 {
 			m.progressCurrent = msg.event.Current
 		}
 		if msg.event.Total > 0 {
+			if msg.event.Current == 0 && (msg.event.Stage != prevStage || msg.event.Total != m.progressTotal) {
+				m.progressCurrent = 0
+			}
 			m.progressTotal = msg.event.Total
 		}
 		if msg.event.Successes > 0 || (msg.event.Current == 0 && msg.event.Total == 0 && msg.event.Failures > 0) {
@@ -435,12 +439,13 @@ func (m Model) openDirectoryPicker(mode workflowMode) (tea.Model, tea.Cmd) {
 }
 
 // openTargetDirectoryPicker transitions to the cross-repo target directory browser.
-// It starts from the previously saved target.base_dir (if any) or the filesystem root.
+// It always starts from the parent directory of the current working directory.
 func (m Model) openTargetDirectoryPicker() (tea.Model, tea.Cmd) {
-	startPath := strings.TrimSpace(m.cfg.Target.BaseDir)
+	startPath := strings.TrimSpace(m.opts.WorkDir)
 	if startPath == "" {
-		startPath = "/"
+		startPath = "."
 	}
+	startPath = filepath.Dir(filepath.Clean(startPath))
 	m.targetBrowsePath = startPath
 	m.activeView = viewTargetDirectory
 	m.lastInfo = "浏览并选择目标仓库目录：Enter 进入子目录，Tab 确认当前目录，Esc 返回上级"
@@ -591,7 +596,13 @@ func (m Model) renderRunningView() string {
 	contentWidth := maxInt(40, m.width-2)
 	stage := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81")).Render(strings.ToUpper(emptyFallback(m.currentStage, "queued")))
 	current := lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Render(emptyFallback(m.currentFile, "-"))
-	header := joinEdge("Running "+stage+"  "+current, renderProgressSummary(m.progressCurrent, m.progressTotal), contentWidth)
+	var progressIndicator string
+	if m.currentStage == "scan" {
+		progressIndicator = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("⟳ scanning…")
+	} else {
+		progressIndicator = renderProgressSummary(m.progressCurrent, m.progressTotal)
+	}
+	header := joinEdge("Running "+stage+"  "+current, progressIndicator, contentWidth)
 
 	logs := strings.Join(m.visibleLogs(), "\n")
 	if strings.TrimSpace(logs) == "" {

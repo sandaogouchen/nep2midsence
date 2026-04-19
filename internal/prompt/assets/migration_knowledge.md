@@ -7,14 +7,21 @@
 ```typescript
 import { MidsceneCaseFunctionParams } from '@byted-midscene/pagepass-plugin';
 import type { CaseFunctionParams } from '@pagepass/test';
-
-describe('模块名', () => {
+import { SET_UP_CAMPAIGN_COOKIES } from '@pages/WebAds/utils/create_ads_common/CaseCommon';
+describe('case_name', () => {
+  before(async ({ page }) => {
+    await SET_UP_CAMPAIGN_COOKIES(page, advId);
+  });
   it('case 名称', async (params: CaseFunctionParams<'test'>) => {
+    const { page } = params;
     const { midscene } = params as MidsceneCaseFunctionParams;
     const { agent } = midscene!;
-    const campaignLogic = new SalesCreateLogic(page);
-    await campaignLogic.goToCreatePage({ advid: advid });//advid信息根据原有代码动态获取
-    // 所有操作通过 agent 完成
+
+    // 起手必须先复用原 case 的 before 链路，完成环境、cookie、权限、advId 注入
+    // 不要把 goToCreatePage() 当成固定模板；页面进入方式沿用原 case 即可
+    await page.goto('原 case 实际访问的页面或入口链接');
+
+    // 所有交互统一通过 agent 完成
     await agent.aiTap("点击'Sales'");
     await agent.aiInput("55", "'Daily'右侧的输入框");
     await agent.aiAssert("展示'Goal'元素");
@@ -22,15 +29,43 @@ describe('模块名', () => {
 });
 ```
 
-**关键三行（导入 → 解构 → 取 agent）**：
+**关键起手式（导入 → before 注入 → 解构 → 取 agent）**：
 
 ```typescript
 import { MidsceneCaseFunctionParams } from '@byted-midscene/pagepass-plugin';
+before(async ({ page }) => {
+  await 原 case 中的 before 注入函数(page);
+});
+before(commonBeforeForBrandAuction);
 const { midscene } = params as MidsceneCaseFunctionParams;
 const { agent } = midscene!;
 ```
 
 > `agent` 是所有 AI 操作的唯一入口，替代 NEP 中的 `page.element()`、`ai?.action()`、`ai?.getElement()` 等全部方式。
+
+> `before` 链路不要删。像 `commonBeforeForBrandAuction` 这类封装，本质上会继续走 `commonBefore(..., EnumAdvIDInfo.ADV_Brand_Auction)`，里面会执行 `setEnv(page)`、`setCookies(page, advInfo?.userId)`、`mockPermission(page, advInfo)`、`mockUnSelectReco(page, advInfo?.advId)` 和窗口尺寸设置；这部分就是当前页面跳转前所依赖的 cookie / 用户 / 广告主上下文。
+
+> case 级 `before` 也要保留，但不要把函数名写死。agent 必须回到原始 case 代码里查当前 case 实际用了哪个 `before(async ({ page }) => ...)` 注入函数，并原样继承到 Midscene case 中。它通常负责在进入页面前补齐接口拦截，例如：
+
+```typescript
+export const XxxActionCreation = (page: Page) => {
+  return page.intercept(
+    '某个原 case 依赖的接口',
+    MockResponse,
+  );
+};
+```
+
+> 也就是说，agent 的固定动作应该是：先打开原始 case 文件，找到 `describe` 里的全部 `before(...)` / `beforeEach(...)`，识别出页面跳转前依赖的注入函数、公共 `commonBeforeXxx` 封装、以及对应的 `EnumAdvIDInfo`，再把这套上下文迁移到 Midscene case；不要臆造一个通用的 `BrandActionCreation`。
+
+> 对应账号信息如果原 case 使用 `EnumAdvIDInfo.ADV_Brand_Auction`，则沿用这套 advertiser 上下文：
+
+```typescript
+ADV_Brand_Auction: {
+  advId: '7594306930307383297',
+  userId: '7594306459032159243',
+},
+```
 
 ---
 
@@ -222,6 +257,89 @@ NEP `【】`/`[]` → Midscene `''`（单引号），语义保持一致即可。
 4. **传入 agent**：新函数需要接收 `agent` 参数（由 case 传入），而非原来的 `page`/`ai` 参数
 
 5. **避免重复**：若封装文件中已存在 `xxxMidscene` 版本函数，case 直接调用即可，无需再次新建
+
+---
+
+## 5.5 commonIt Wrapper 迁移规则
+
+### 什么是 commonIt
+
+`commonIt` 是 NEP E2E 测试中常见的测试封装函数，它包装了标准 `it`/`test`，自动完成：
+
+1. **URL 导航**：自动跳转到指定测试页面
+2. **Page Object 注入**：自动实例化并注入业务 Page Object（如 `listPage`、`createPage`）
+3. **参数解构**：回调函数通过参数解构接收 `{ page, ai, listPage, caseParams, ... }`
+
+```typescript
+// NEP 中的 commonIt 用法
+commonIt('创建广告', { url: '/campaign/create', pageObjects: [ListPage, CreatePage] }, 
+  async ({ page, ai, listPage, createPage, caseParams }) => {
+    // page, ai, listPage, createPage 都是 wrapper 自动注入的
+    await listPage.commonActions.clickCreate();
+    await ai?.action('点击[Continue]');
+  }
+);
+```
+
+### 迁移规则
+
+将 `commonIt` 迁移到标准 Midscene `it`/`test` 时：
+
+1. **替换 wrapper**：`commonIt(...)` → `it(...)` 或 `test(...)`
+2. **回调签名**：改为 `CaseFunctionParams<'test'>`，仅接收 `{ page, midscene }`
+3. **显式导航**：wrapper 自动执行的 URL 跳转需在 test body 开头手动补上：
+   ```typescript
+   await page.goto('/campaign/create');
+   ```
+4. **Page Object 实例化**：wrapper 注入的 Page Object 需自行创建：
+   ```typescript
+   const listPage = new ListPage(page);
+   const createPage = new CreatePage(page);
+   ```
+5. **删除 wrapper import**：移除对 `commonIt` 的 import 声明
+6. **识别假依赖**：`commonIt` 回调参数中解构出的变量（如 `listPage`、`caseParams`）是 wrapper 在运行时注入的，**不是真实的模块 import**。迁移时不要试图从其他文件 import 这些变量，而应按上述规则自行实例化或替换
+
+### 迁移示例
+
+**迁移前（NEP + commonIt）**：
+```typescript
+import { commonIt } from '@e2e/common';
+import { ListPage } from '@pages/ListPage';
+
+describe('Campaign', () => {
+  commonIt('编辑广告', { url: '/campaign/list' }, 
+    async ({ page, ai, listPage, caseParams }) => {
+      await listPage.commonActions.editCampaign(page, ai, caseParams.name);
+      await ai?.action('点击[Save]');
+    }
+  );
+});
+```
+
+**迁移后（Midscene 标准写法）**：
+```typescript
+import { MidsceneCaseFunctionParams } from '@byted-midscene/pagepass-plugin';
+import type { CaseFunctionParams } from '@pagepass/test';
+import { ListPage } from '@pages/ListPage';
+
+describe('Campaign', () => {
+  it('编辑广告', async (params: CaseFunctionParams<'test'>) => {
+    const { page } = params;
+    const { midscene } = params as MidsceneCaseFunctionParams;
+    const { agent } = midscene!;
+
+    // 1. 显式导航（原 wrapper 自动完成）
+    await page.goto('/campaign/list');
+
+    // 2. 手动实例化 Page Object（原 wrapper 自动注入）
+    const listPage = new ListPage(page);
+
+    // 3. 业务逻辑迁移
+    await listPage.commonActions.editCampaignMidscene(agent, caseParams.name);
+    await agent.aiTap("点击'Save'");
+  });
+});
+```
 
 ---
 

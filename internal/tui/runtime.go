@@ -56,11 +56,26 @@ type Runtime interface {
 
 // AppRuntime is the concrete runtime wired to the existing analyzer/executor/verify pipeline.
 type AppRuntime struct {
-	cfg *config.Config
+	cfg               *config.Config
+	preflightCheck    func(string) error
+	newPromptExecutor func(tool, workDir string) executor.PromptExecutor
 }
 
 func NewRuntime(cfg *config.Config) *AppRuntime {
-	return &AppRuntime{cfg: cfg}
+	return &AppRuntime{
+		cfg:            cfg,
+		preflightCheck: executor.PreflightCheckForTool,
+		newPromptExecutor: func(tool, workDir string) executor.PromptExecutor {
+			switch tool {
+			case executor.ToolCC:
+				return executor.NewCCExecutor(workDir, 0)
+			case executor.ToolCodex:
+				return executor.NewCodexExecutor(workDir, 0)
+			default:
+				return executor.NewCocoExecutor(workDir, 0)
+			}
+		},
+	}
 }
 
 func (r *AppRuntime) ListDirectories(root string) ([]string, error) {
@@ -120,7 +135,20 @@ func (r *AppRuntime) ListImmediateDirectories(path string) ([]string, error) {
 func (r *AppRuntime) RunAnalyze(ctx context.Context, dir string, notify func(WorkflowEvent)) (*WorkflowResult, error) {
 	notify(WorkflowEvent{Stage: "analyze", Message: "正在分析目录", CurrentFile: dir})
 	engine := analyzer.NewEngine(r.cfg)
-	analyses, err := engine.AnalyzeDir(dir)
+	analyses, err := engine.AnalyzeDirWithProgress(dir, func(current, total int, filePath string) {
+		notify(WorkflowEvent{
+			Stage:       "analyze",
+			Current:     current,
+			Total:       total,
+			CurrentFile: filePath,
+		})
+	}, func(matchedSoFar int, currentPath string) {
+		notify(WorkflowEvent{
+			Stage:       "scan",
+			Message:     fmt.Sprintf("扫描目录中… 已匹配 %d 个文件", matchedSoFar),
+			CurrentFile: currentPath,
+		})
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +167,7 @@ func (r *AppRuntime) RunStart(ctx context.Context, dir string, targetBaseDir str
 		tool = executor.ToolCoco
 	}
 	notify(WorkflowEvent{Stage: "preflight", Message: fmt.Sprintf("检查 %s", tool)})
-	if err := executor.PreflightCheckForTool(tool); err != nil {
+	if err := r.preflightCheck(tool); err != nil {
 		return nil, err
 	}
 
@@ -153,7 +181,20 @@ func (r *AppRuntime) RunStart(ctx context.Context, dir string, targetBaseDir str
 	}
 
 	notify(WorkflowEvent{Stage: "analyze", Message: "分析目录结构"})
-	analyses, err := engine.AnalyzeDir(dir)
+	analyses, err := engine.AnalyzeDirWithProgress(dir, func(current, total int, filePath string) {
+		notify(WorkflowEvent{
+			Stage:       "analyze",
+			Current:     current,
+			Total:       total,
+			CurrentFile: filePath,
+		})
+	}, func(matchedSoFar int, currentPath string) {
+		notify(WorkflowEvent{
+			Stage:       "scan",
+			Message:     fmt.Sprintf("扫描目录中… 已匹配 %d 个文件", matchedSoFar),
+			CurrentFile: currentPath,
+		})
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -189,15 +230,7 @@ func (r *AppRuntime) RunStart(ctx context.Context, dir string, targetBaseDir str
 		}
 	}
 
-	var promptExec executor.PromptExecutor
-	switch tool {
-	case executor.ToolCC:
-		promptExec = executor.NewCCExecutor(execWorkDir, 0)
-	case executor.ToolCodex:
-		promptExec = executor.NewCodexExecutor(execWorkDir, 0)
-	default:
-		promptExec = executor.NewCocoExecutor(execWorkDir, 0)
-	}
+	promptExec := r.newPromptExecutor(tool, execWorkDir)
 
 	scheduler := executor.NewScheduler(promptExec, gen, r.cfg.Execution.MaxJobs, r.cfg.Execution.RetryLimit)
 
@@ -279,57 +312,154 @@ func (r *AppRuntime) RunStart(ctx context.Context, dir string, targetBaseDir str
 		results = append(results, scheduler.Run(ctx, plan.ToExecuteCases)...)
 	}
 
+	analysisByTaskKey := make(map[string]*types.FullAnalysis, len(plan.ToExecuteHelpers)+len(plan.ToExecuteCases))
+	for _, analysis := range plan.ToExecuteHelpers {
+		if analysis != nil && strings.TrimSpace(analysis.TaskKey) != "" {
+			analysisByTaskKey[analysis.TaskKey] = analysis
+		}
+	}
+	for _, analysis := range plan.ToExecuteCases {
+		if analysis != nil && strings.TrimSpace(analysis.TaskKey) != "" {
+			analysisByTaskKey[analysis.TaskKey] = analysis
+		}
+	}
+
 	notify(WorkflowEvent{Stage: "verify", Message: "验证迁移结果"})
 	verifyDir := dir
 	if strings.TrimSpace(targetBaseDir) != "" {
 		verifyDir = targetBaseDir
 	}
-	verifier := verify.NewVerifier(verifyDir, "", "")
+	buildCmd := buildTypeScriptCompileCommand(verifyDir, results)
+	verifier := verify.NewVerifier(verifyDir, buildCmd, "")
 	verifyResults := verifier.VerifyAll(results)
 
+	// Cumulative counters for the status line across fix stages.
+	// Start from the execute stage's final values so Planned/Shifted/Failed
+	// accumulate instead of resetting per stage.
+	cumulativePlanned := plan.TotalPlanned
+	cumulativeShifted := successes
+	cumulativeFailed := failures
+
+	var mu sync.Mutex
 	// NEP residual fix loop: re-execute AI fix for files that still contain NEP markers.
 	maxNepFixRounds := r.cfg.Execution.RetryLimit
 	if maxNepFixRounds <= 0 {
 		maxNepFixRounds = 2
 	}
 	for round := 1; round <= maxNepFixRounds; round++ {
-		var nepFailedIdx []int
-		for i, vr := range verifyResults {
-			if !vr.NepCleanOK && vr.NepCleanError != "" && results[i].Success {
-				nepFailedIdx = append(nepFailedIdx, i)
-			}
-		}
+		nepFailedIdx := collectNepFixIndices(results, verifyResults)
 		if len(nepFailedIdx) == 0 {
 			break
 		}
 
+		cumulativePlanned += len(nepFailedIdx)
 		notify(WorkflowEvent{
-			Stage:   "nep-fix",
-			Message: fmt.Sprintf("NEP 残留修正（第 %d 轮，%d 个文件）", round, len(nepFailedIdx)),
-			Total:   len(nepFailedIdx),
+			Stage:     "nep-fix",
+			Message:   fmt.Sprintf("NEP 残留修正（第 %d 轮，%d 个文件）", round, len(nepFailedIdx)),
+			Total:     cumulativePlanned,
+			Successes: cumulativeShifted,
+			Failures:  cumulativeFailed,
 		})
 
-		for fixNum, idx := range nepFailedIdx {
-			res := results[idx]
-			vr := verifyResults[idx]
-			fixPrompt := gen.GenerateNepFixPrompt(res.TargetFile, vr.NepCleanError, round)
+		{
+			nepSem := make(chan struct{}, 6)
+			var nepWg sync.WaitGroup
+			for fixNum, idx := range nepFailedIdx {
+				nepWg.Add(1)
+				go func(fn, i int) {
+					defer nepWg.Done()
+					nepSem <- struct{}{}
+					defer func() { <-nepSem }()
 
-			notify(WorkflowEvent{
-				Stage:       "nep-fix",
-				Message:     fmt.Sprintf("修正 %s", filepath.Base(res.TargetFile)),
-				Current:     fixNum + 1,
-				Total:       len(nepFailedIdx),
-				CurrentFile: res.TargetFile,
-			})
+					res := results[i]
+					vr := verifyResults[i]
+					fixPrompt := gen.GenerateNepFixPrompt(res.TargetFile, vr.NepCleanError, round)
 
-			output, execErr := promptExec.Execute(ctx, fixPrompt)
-			res.NepFixAttempts = round
-			if execErr == nil && output.Success {
-				// Re-verify NEP cleanliness after fix.
-				cleanOK, cleanErr := verify.CheckNepClean(res.TargetFile)
-				verifyResults[idx].NepCleanOK = cleanOK
-				verifyResults[idx].NepCleanError = cleanErr
+					notify(WorkflowEvent{
+						Stage:       "nep-fix",
+						Message:     fmt.Sprintf("修正 %s", filepath.Base(res.TargetFile)),
+						Current:     fn + 1,
+						Total:       cumulativePlanned,
+						Successes:   cumulativeShifted,
+						Failures:    cumulativeFailed,
+						CurrentFile: res.TargetFile,
+					})
+
+					output, execErr := promptExec.Execute(ctx, fixPrompt)
+					res.NepFixAttempts = round
+					if execErr == nil && output.Success {
+						refreshVerifyState(verifier, res.TargetFile, verifyResults[i])
+						mu.Lock()
+						cumulativeShifted++
+						mu.Unlock()
+					} else {
+						mu.Lock()
+						cumulativeFailed++
+						mu.Unlock()
+					}
+				}(fixNum, idx)
 			}
+			nepWg.Wait()
+		}
+	}
+
+	maxCompileFixRounds := r.cfg.Execution.RetryLimit
+	if maxCompileFixRounds <= 0 {
+		maxCompileFixRounds = 2
+	}
+	for round := 1; round <= maxCompileFixRounds; round++ {
+		compileFailedIdx := collectCompileFixIndices(results, verifyResults)
+		if len(compileFailedIdx) == 0 {
+			break
+		}
+
+		cumulativePlanned += len(compileFailedIdx)
+		notify(WorkflowEvent{
+			Stage:     "compile-fix",
+			Message:   fmt.Sprintf("编译失败修复（第 %d 轮，%d 个文件）", round, len(compileFailedIdx)),
+			Total:     cumulativePlanned,
+			Successes: cumulativeShifted,
+			Failures:  cumulativeFailed,
+		})
+
+		{
+			compileSem := make(chan struct{}, 6)
+			var compileWg sync.WaitGroup
+			for fixNum, idx := range compileFailedIdx {
+				compileWg.Add(1)
+				go func(fn, i int) {
+					defer compileWg.Done()
+					compileSem <- struct{}{}
+					defer func() { <-compileSem }()
+
+					res := results[i]
+					vr := verifyResults[i]
+					fixPrompt := gen.GenerateCompileFixPrompt(analysisByTaskKey[res.TaskKey], res.TargetFile, vr.CompileError, round)
+
+					notify(WorkflowEvent{
+						Stage:       "compile-fix",
+						Message:     fmt.Sprintf("修正 %s", filepath.Base(res.TargetFile)),
+						Current:     fn + 1,
+						Total:       cumulativePlanned,
+						Successes:   cumulativeShifted,
+						Failures:    cumulativeFailed,
+						CurrentFile: res.TargetFile,
+					})
+
+					output, execErr := promptExec.Execute(ctx, fixPrompt)
+					if execErr == nil && output.Success {
+						refreshVerifyState(verifier, res.TargetFile, verifyResults[i])
+						mu.Lock()
+						cumulativeShifted++
+						mu.Unlock()
+					} else {
+						mu.Lock()
+						cumulativeFailed++
+						mu.Unlock()
+					}
+				}(fixNum, idx)
+			}
+			compileWg.Wait()
 		}
 	}
 
@@ -353,6 +483,93 @@ func (r *AppRuntime) RunStart(ctx context.Context, dir string, targetBaseDir str
 		Verifies: verifyResults,
 		Report:   report,
 	}, nil
+}
+
+type compileChecker interface {
+	CheckCompile(targetFile string) (bool, string)
+}
+
+func collectNepFixIndices(results []*types.MigrationResult, verifyResults []*types.VerifyResult) []int {
+	var indices []int
+	for i, vr := range verifyResults {
+		if i >= len(results) || vr == nil || results[i] == nil {
+			continue
+		}
+		if !vr.NepCleanOK && vr.NepCleanError != "" && results[i].Success {
+			indices = append(indices, i)
+		}
+	}
+	return indices
+}
+
+func collectCompileFixIndices(results []*types.MigrationResult, verifyResults []*types.VerifyResult) []int {
+	var indices []int
+	for i, vr := range verifyResults {
+		if i >= len(results) || vr == nil || results[i] == nil {
+			continue
+		}
+		if results[i].Success && !vr.CompileOK && strings.TrimSpace(vr.CompileError) != "" {
+			indices = append(indices, i)
+		}
+	}
+	return indices
+}
+
+func refreshVerifyState(checker compileChecker, targetFile string, vr *types.VerifyResult) {
+	if checker == nil || vr == nil {
+		return
+	}
+	vr.NepCleanOK, vr.NepCleanError = verify.CheckNepClean(targetFile)
+	vr.CompileOK, vr.CompileError = checker.CheckCompile(targetFile)
+}
+
+func buildTypeScriptCompileCommand(verifyDir string, results []*types.MigrationResult) string {
+	tsconfigPath := findNearestTSConfigFromResults(results)
+	if tsconfigPath == "" {
+		tsconfigPath = findNearestTSConfigFromDir(verifyDir)
+	}
+
+	if tsconfigPath == "" {
+		return "npx tsc --noEmit"
+	}
+
+	projectRoot := filepath.Dir(tsconfigPath)
+	localTSC := filepath.Join(projectRoot, "node_modules", ".bin", "tsc")
+	if info, err := os.Stat(localTSC); err == nil && !info.IsDir() {
+		return localTSC + " --noEmit -p " + tsconfigPath
+	}
+	return "npx tsc --noEmit -p " + tsconfigPath
+}
+
+func findNearestTSConfigFromResults(results []*types.MigrationResult) string {
+	for _, result := range results {
+		if result == nil || strings.TrimSpace(result.TargetFile) == "" {
+			continue
+		}
+		if tsconfigPath := findNearestTSConfig(result.TargetFile); tsconfigPath != "" {
+			return tsconfigPath
+		}
+	}
+	return ""
+}
+
+func findNearestTSConfigFromDir(startDir string) string {
+	cur := filepath.Clean(strings.TrimSpace(startDir))
+	if cur == "" {
+		return ""
+	}
+	for cur != "" {
+		candidate := filepath.Join(cur, "tsconfig.json")
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+	return ""
 }
 
 type planItemMeta struct {
@@ -388,6 +605,12 @@ type helperReceiverResolution struct {
 	Dependencies      []string
 }
 
+type sharedDependencyCandidate struct {
+	SourceFile  string
+	CaseFiles   map[string]struct{}
+	ImportPaths map[string]struct{}
+}
+
 func buildMigrationPlan(cfg *config.Config, engine *analyzer.Engine, analyses []*types.FullAnalysis, store *executor.StateStore) (*migrationPlan, error) {
 	// Partition: treat files with tests as cases.
 	var cases []*types.FullAnalysis
@@ -414,7 +637,9 @@ func buildMigrationPlan(cfg *config.Config, engine *analyzer.Engine, analyses []
 	// Discover helper candidates from all cases.
 	helperPaths := make(map[string]struct{})
 	receiverCandidates := make(map[string]*helperReceiverCandidate)
+	sharedDeps := make(map[string]*sharedDependencyCandidate)
 	for _, ca := range cases {
+		ca.ResolvedSymbolDeps = collectResolvedSymbolDependencies(ca, tscp, cfg)
 		deps := collectLocalImportDeps(ca, tscp)
 		funcNames := collectCandidateFuncNames(ca)
 		scanned := scanHelperCandidates(filepath.Dir(ca.FilePath), funcNames)
@@ -438,7 +663,23 @@ func buildMigrationPlan(cfg *config.Config, engine *analyzer.Engine, analyses []
 				helperPaths[p] = struct{}{}
 			}
 		}
+		for sourceFile, importPath := range collectSharedDependencyImports(ca, tscp) {
+			candidate := sharedDeps[sourceFile]
+			if candidate == nil {
+				candidate = &sharedDependencyCandidate{
+					SourceFile:  sourceFile,
+					CaseFiles:   make(map[string]struct{}),
+					ImportPaths: make(map[string]struct{}),
+				}
+				sharedDeps[sourceFile] = candidate
+			}
+			candidate.CaseFiles[ca.FilePath] = struct{}{}
+			if strings.TrimSpace(importPath) != "" {
+				candidate.ImportPaths[importPath] = struct{}{}
+			}
+		}
 		collectHelperReceiverCandidates(ca, receiverCandidates)
+		collectConstructorHelperCandidates(ca, tscp, receiverCandidates)
 	}
 
 	// Analyze helper-related files for DEFAULT_PROMPT extraction and case context.
@@ -459,6 +700,7 @@ func buildMigrationPlan(cfg *config.Config, engine *analyzer.Engine, analyses []
 	}
 
 	var helpers []*types.FullAnalysis
+	var dependencyTasks []*types.FullAnalysis
 	var alreadyMigratedMetas []planItemMeta
 	unresolvedByCase := make(map[string][]types.UnresolvedHelper)
 	caseByFilePath := make(map[string]*types.FullAnalysis, len(cases))
@@ -488,9 +730,10 @@ func buildMigrationPlan(cfg *config.Config, engine *analyzer.Engine, analyses []
 			for _, method := range sortedSet(methods) {
 				if reason := resolution.UnresolvedReasons[method]; reason != "" {
 					unresolvedByCase[caseFile] = append(unresolvedByCase[caseFile], types.UnresolvedHelper{
-						Receiver: receiver,
-						Method:   method,
-						Reason:   reason,
+						Receiver:          receiver,
+						Method:            method,
+						Reason:            reason,
+						ReceiverReachable: true,
 					})
 				}
 			}
@@ -533,6 +776,34 @@ func buildMigrationPlan(cfg *config.Config, engine *analyzer.Engine, analyses []
 		}
 	}
 
+	sharedDepKeys := make([]string, 0, len(sharedDeps))
+	for sourceFile := range sharedDeps {
+		sharedDepKeys = append(sharedDepKeys, sourceFile)
+	}
+	sort.Strings(sharedDepKeys)
+	for _, sourceFile := range sharedDepKeys {
+		candidate := sharedDeps[sourceFile]
+		if candidate == nil {
+			continue
+		}
+		analysis, err := engine.AnalyzeFile(sourceFile)
+		if err != nil || analysis == nil {
+			continue
+		}
+		analysis.TaskKind = "dependency"
+		analysis.TaskKey = defaultTaskKey("dependency", analysis.FilePath)
+		analysis.Dependencies = uniqueStrings(collectLocalImportDeps(analysis, tscp))
+		dependencyTasks = append(dependencyTasks, analysis)
+
+		for caseFile := range candidate.CaseFiles {
+			ca := caseByFilePath[caseFile]
+			if ca == nil {
+				continue
+			}
+			ca.Dependencies = uniqueStrings(append(ca.Dependencies, analysis.TargetPath))
+		}
+	}
+
 	// Attach DEFAULT_PROMPT entries from dependencies to each case so the prompt
 	// can guide AI migration for NEP component wrappers.
 	for _, ca := range cases {
@@ -559,12 +830,21 @@ func buildMigrationPlan(cfg *config.Config, engine *analyzer.Engine, analyses []
 	}
 
 	// Dedup helpers/cases by task key.
-	helperByTask := make(map[string]*types.FullAnalysis)
+	preCaseByTask := make(map[string]*types.FullAnalysis)
+	preCaseTaskKind := make(map[string]string)
+	for _, dep := range dependencyTasks {
+		if dep == nil {
+			continue
+		}
+		preCaseByTask[dep.TaskKey] = dep
+		preCaseTaskKind[dep.TaskKey] = "dependency"
+	}
 	for _, h := range helpers {
 		if h == nil {
 			continue
 		}
-		helperByTask[h.TaskKey] = h
+		preCaseByTask[h.TaskKey] = h
+		preCaseTaskKind[h.TaskKey] = "helper"
 	}
 	caseByTask := make(map[string]*types.FullAnalysis)
 	for _, c := range cases {
@@ -576,11 +856,11 @@ func buildMigrationPlan(cfg *config.Config, engine *analyzer.Engine, analyses []
 
 	plan := &migrationPlan{MetaByTaskKey: make(map[string]planItemMeta), AlreadyMigrated: alreadyMigratedMetas}
 	// preserve a stable order for execution.
-	sortedHelpers := make([]string, 0, len(helperByTask))
-	for taskKey := range helperByTask {
-		sortedHelpers = append(sortedHelpers, taskKey)
+	sortedPreCase := make([]string, 0, len(preCaseByTask))
+	for taskKey := range preCaseByTask {
+		sortedPreCase = append(sortedPreCase, taskKey)
 	}
-	sort.Strings(sortedHelpers)
+	sort.Strings(sortedPreCase)
 	sortedCases := make([]string, 0, len(caseByTask))
 	for taskKey := range caseByTask {
 		sortedCases = append(sortedCases, taskKey)
@@ -611,8 +891,8 @@ func buildMigrationPlan(cfg *config.Config, engine *analyzer.Engine, analyses []
 		*toExecute = append(*toExecute, a)
 	}
 
-	for _, taskKey := range sortedHelpers {
-		addPlanned("helper", helperByTask[taskKey], &plan.ToExecuteHelpers)
+	for _, taskKey := range sortedPreCase {
+		addPlanned(preCaseTaskKind[taskKey], preCaseByTask[taskKey], &plan.ToExecuteHelpers)
 	}
 	for _, taskKey := range sortedCases {
 		addPlanned("case", caseByTask[taskKey], &plan.ToExecuteCases)
@@ -639,9 +919,10 @@ func collectHelperReceiverCandidates(ca *types.FullAnalysis, candidates map[stri
 			}
 			candidate := candidates[receiver]
 			if candidate == nil {
+				pageObjectFile := strings.TrimSpace(step.OwnerFile)
 				candidate = &helperReceiverCandidate{
 					Receiver:       receiver,
-					PageObjectFile: filepath.Clean(step.OwnerFile),
+					PageObjectFile: pageObjectFile,
 					MethodsByCase:  make(map[string]map[string]struct{}),
 				}
 				candidates[receiver] = candidate
@@ -658,11 +939,174 @@ func collectHelperReceiverCandidates(ca *types.FullAnalysis, candidates map[stri
 	}
 }
 
+func collectConstructorHelperCandidates(ca *types.FullAnalysis, tscp *config.TsConfigPaths, candidates map[string]*helperReceiverCandidate) {
+	if ca == nil || ca.AST == nil {
+		return
+	}
+	sourceBytes, err := os.ReadFile(ca.FilePath)
+	if err != nil {
+		return
+	}
+	sourceText := string(sourceBytes)
+
+	importedClasses := make(map[string]string)
+	for _, imp := range ca.AST.Imports {
+		if !isLocalImportPath(imp.Path, tscp) {
+			continue
+		}
+		moduleFile := resolveImportFile(ca.FilePath, imp.Path, tscp)
+		for _, symbol := range parseImportedSymbols(imp.Name) {
+			name := strings.TrimSpace(symbol.LocalAlias)
+			if name == "" {
+				name = strings.TrimSpace(symbol.ImportedName)
+			}
+			if name == "" {
+				continue
+			}
+			if moduleFile == "" {
+				roots := []string{filepath.Dir(ca.FilePath)}
+				if tscp != nil && strings.TrimSpace(tscp.ProjectRoot) != "" {
+					roots = append(roots, tscp.ProjectRoot)
+				}
+				if hits := scanFilesByBaseName(uniqueStrings(roots), name); len(hits) > 0 {
+					moduleFile = hits[0]
+				}
+			}
+			if moduleFile == "" {
+				continue
+			}
+			importedClasses[name] = moduleFile
+		}
+	}
+	for name, moduleFile := range parseImportedClassesFromSource(ca.FilePath, sourceText, tscp) {
+		if strings.TrimSpace(name) == "" || strings.TrimSpace(moduleFile) == "" {
+			continue
+		}
+		if _, ok := importedClasses[name]; !ok {
+			importedClasses[name] = moduleFile
+		}
+	}
+	if len(importedClasses) == 0 {
+		return
+	}
+
+	constructorRe := regexp.MustCompile(`\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*new\s+([A-Za-z_$][\w$]*)\s*\(`)
+	methodReCache := make(map[string]*regexp.Regexp)
+	matches := constructorRe.FindAllStringSubmatch(sourceText, -1)
+	for _, match := range matches {
+		if len(match) != 3 {
+			continue
+		}
+		varName := strings.TrimSpace(match[1])
+		className := strings.TrimSpace(match[2])
+		moduleFile := strings.TrimSpace(importedClasses[className])
+		if varName == "" || className == "" || moduleFile == "" {
+			continue
+		}
+		methodRe := methodReCache[varName]
+		if methodRe == nil {
+			methodRe = regexp.MustCompile(`\b` + regexp.QuoteMeta(varName) + `\.([A-Za-z_$][\w$]*)\s*\(`)
+			methodReCache[varName] = methodRe
+		}
+		methodMatches := methodRe.FindAllStringSubmatch(sourceText, -1)
+		if len(methodMatches) == 0 {
+			continue
+		}
+		candidate := candidates[varName]
+		if candidate == nil {
+			candidate = &helperReceiverCandidate{
+				Receiver:       varName,
+				PageObjectFile: filepath.Clean(moduleFile),
+				MethodsByCase:  make(map[string]map[string]struct{}),
+			}
+			candidates[varName] = candidate
+		}
+		if candidate.PageObjectFile == "" {
+			candidate.PageObjectFile = filepath.Clean(moduleFile)
+		}
+		if candidate.MethodsByCase[ca.FilePath] == nil {
+			candidate.MethodsByCase[ca.FilePath] = make(map[string]struct{})
+			candidate.CaseFiles = append(candidate.CaseFiles, ca.FilePath)
+		}
+		for _, methodMatch := range methodMatches {
+			if len(methodMatch) != 2 {
+				continue
+			}
+			method := strings.TrimSpace(methodMatch[1])
+			if method == "" {
+				continue
+			}
+			candidate.MethodsByCase[ca.FilePath][method] = struct{}{}
+		}
+	}
+}
+
+func parseImportedClassesFromSource(baseFile string, sourceText string, tscp *config.TsConfigPaths) map[string]string {
+	out := make(map[string]string)
+	add := func(name string, importPath string) {
+		name = strings.TrimSpace(name)
+		importPath = strings.TrimSpace(importPath)
+		if name == "" || importPath == "" {
+			return
+		}
+		moduleFile := resolveImportFile(baseFile, importPath, tscp)
+		if moduleFile == "" {
+			roots := []string{filepath.Dir(baseFile)}
+			if tscp != nil && strings.TrimSpace(tscp.ProjectRoot) != "" {
+				roots = append(roots, tscp.ProjectRoot)
+			}
+			if hits := scanFilesByBaseName(uniqueStrings(roots), name); len(hits) > 0 {
+				moduleFile = hits[0]
+			}
+		}
+		if moduleFile == "" {
+			return
+		}
+		out[name] = moduleFile
+	}
+
+	defaultImportRe := regexp.MustCompile(`(?m)^\s*import\s+([A-Za-z_$][\w$]*)\s+from\s+['"]([^'"]+)['"]`)
+	for _, match := range defaultImportRe.FindAllStringSubmatch(sourceText, -1) {
+		if len(match) != 3 {
+			continue
+		}
+		add(match[1], match[2])
+	}
+
+	namedImportRe := regexp.MustCompile(`(?m)^\s*import\s*\{([^}]*)\}\s*from\s*['"]([^'"]+)['"]`)
+	for _, match := range namedImportRe.FindAllStringSubmatch(sourceText, -1) {
+		if len(match) != 3 {
+			continue
+		}
+		importPath := match[2]
+		for _, item := range strings.Split(match[1], ",") {
+			item = strings.TrimSpace(item)
+			if item == "" {
+				continue
+			}
+			parts := strings.Fields(item)
+			switch {
+			case len(parts) == 1:
+				add(parts[0], importPath)
+			case len(parts) >= 3 && strings.EqualFold(parts[1], "as"):
+				add(parts[len(parts)-1], importPath)
+			}
+		}
+	}
+
+	return out
+}
+
 func resolveHelperReceiverCandidate(candidate *helperReceiverCandidate, tscp *config.TsConfigPaths, engine *analyzer.Engine) (*helperReceiverResolution, error) {
 	if candidate == nil {
 		return nil, nil
 	}
 	pageObjectFile := strings.TrimSpace(candidate.PageObjectFile)
+	if pageObjectFile == "" && len(candidate.CaseFiles) > 0 {
+		if resolved := resolveConstructorReceiverModule(candidate.CaseFiles[0], candidate.Receiver, tscp); resolved != "" {
+			pageObjectFile = resolved
+		}
+	}
 	if pageObjectFile == "" && len(candidate.CaseFiles) > 0 {
 		parts := strings.Split(strings.TrimSpace(candidate.Receiver), ".")
 		propertyName := ""
@@ -705,6 +1149,10 @@ func resolveHelperReceiverCandidate(candidate *helperReceiverCandidate, tscp *co
 		moduleFile = resolved
 	}
 
+	if err := validateHelperModuleFile(moduleFile); err != nil {
+		return nil, err
+	}
+
 	analysis, err := engine.AnalyzeFile(moduleFile)
 	if err != nil {
 		return nil, fmt.Errorf("analyze helper module %s: %w", moduleFile, err)
@@ -728,7 +1176,7 @@ func resolveHelperReceiverCandidate(candidate *helperReceiverCandidate, tscp *co
 	}
 
 	for _, method := range allCandidateMethods(candidate) {
-		if methodDefinedInAnalysis(analysis, method) || containsMethodDefinition(sourceText, method) {
+		if helperMethodDefinedInModuleOrAncestors(moduleFile, analysis, sourceText, method, tscp, engine) {
 			resolution.ResolvedMethods = append(resolution.ResolvedMethods, method)
 			continue
 		}
@@ -736,6 +1184,48 @@ func resolveHelperReceiverCandidate(candidate *helperReceiverCandidate, tscp *co
 	}
 	sort.Strings(resolution.ResolvedMethods)
 	return resolution, nil
+}
+
+func resolveConstructorReceiverModule(caseFile string, receiver string, tscp *config.TsConfigPaths) string {
+	caseFile = strings.TrimSpace(caseFile)
+	receiver = strings.TrimSpace(receiver)
+	if caseFile == "" || receiver == "" {
+		return ""
+	}
+	sourceBytes, err := os.ReadFile(caseFile)
+	if err != nil {
+		return ""
+	}
+	sourceText := string(sourceBytes)
+	re := regexp.MustCompile(`\b(?:const|let|var)\s+` + regexp.QuoteMeta(receiver) + `\s*=\s*new\s+([A-Za-z_$][\w$]*)\s*\(`)
+	match := re.FindStringSubmatch(sourceText)
+	if len(match) != 2 {
+		return ""
+	}
+	className := strings.TrimSpace(match[1])
+	if className == "" {
+		return ""
+	}
+	importedClasses := parseImportedClassesFromSource(caseFile, sourceText, tscp)
+	return strings.TrimSpace(importedClasses[className])
+}
+
+func validateHelperModuleFile(path string) error {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if path == "" {
+		return fmt.Errorf("helper module path is empty")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("helper module path invalid %s: %w", path, err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("helper module path is directory: %s", path)
+	}
+	if !isScriptFile(info.Name()) {
+		return fmt.Errorf("helper module path is not a script file: %s", path)
+	}
+	return nil
 }
 
 func allCandidateMethods(candidate *helperReceiverCandidate) []string {
@@ -786,6 +1276,7 @@ func cloneAnalysis(a *types.FullAnalysis) *types.FullAnalysis {
 	cp.Dependencies = append([]string(nil), a.Dependencies...)
 	cp.DefaultPrompts = append([]types.DefaultPromptInfo(nil), a.DefaultPrompts...)
 	cp.UnresolvedHelpers = append([]types.UnresolvedHelper(nil), a.UnresolvedHelpers...)
+	cp.ResolvedSymbolDeps = append([]types.ResolvedSymbolDependency(nil), a.ResolvedSymbolDeps...)
 	return &cp
 }
 
@@ -850,6 +1341,356 @@ func collectLocalImportDeps(a *types.FullAnalysis, tscp *config.TsConfigPaths) [
 		deps = append(deps, resolved)
 	}
 	return uniqueStrings(deps)
+}
+
+type importedSymbolRef struct {
+	ImportedName string
+	LocalAlias   string
+}
+
+func parseImportedSymbols(importSpec string) []importedSymbolRef {
+	importSpec = strings.TrimSpace(importSpec)
+	if importSpec == "" {
+		return nil
+	}
+
+	var out []importedSymbolRef
+	seen := make(map[string]struct{})
+	add := func(importedName, localAlias string) {
+		importedName = strings.TrimSpace(importedName)
+		localAlias = strings.TrimSpace(localAlias)
+		if importedName == "" {
+			return
+		}
+		key := importedName + "|" + localAlias
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, importedSymbolRef{ImportedName: importedName, LocalAlias: localAlias})
+	}
+
+	if strings.Contains(importSpec, "{") {
+		start := strings.Index(importSpec, "{")
+		end := strings.LastIndex(importSpec, "}")
+		if start >= 0 && end > start {
+			inside := importSpec[start+1 : end]
+			for _, item := range strings.Split(inside, ",") {
+				item = strings.TrimSpace(item)
+				if item == "" {
+					continue
+				}
+				parts := strings.Fields(item)
+				switch {
+				case len(parts) == 1:
+					add(parts[0], "")
+				case len(parts) >= 3 && strings.EqualFold(parts[1], "as"):
+					add(parts[0], parts[len(parts)-1])
+				}
+			}
+		}
+	}
+
+	prefix := importSpec
+	if idx := strings.Index(prefix, "{"); idx >= 0 {
+		prefix = prefix[:idx]
+	}
+	prefix = strings.TrimSpace(strings.TrimSuffix(prefix, ","))
+	if prefix != "" {
+		add(prefix, "")
+	}
+
+	return out
+}
+
+func collectResolvedSymbolDependencies(a *types.FullAnalysis, tscp *config.TsConfigPaths, cfg *config.Config) []types.ResolvedSymbolDependency {
+	if a == nil || a.AST == nil {
+		return nil
+	}
+	var out []types.ResolvedSymbolDependency
+	seen := make(map[string]struct{})
+	for _, imp := range a.AST.Imports {
+		if !isLocalImportPath(imp.Path, tscp) {
+			continue
+		}
+		for _, symbol := range parseImportedSymbols(imp.Name) {
+			dep, err := resolveImportedSymbol(a.FilePath, imp.Path, symbol.ImportedName, tscp)
+			if err != nil {
+				continue
+			}
+			dep.ImportSpec = strings.TrimSpace(imp.Name)
+			dep.LocalAlias = strings.TrimSpace(symbol.LocalAlias)
+			dep.TargetFile = computeDependencyTargetPath(cfg, dep.ExportFile)
+			key := strings.Join([]string{dep.ImportPath, dep.ImportedName, dep.ExportFile, dep.DependencyKind}, "|")
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, dep)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ImportPath == out[j].ImportPath {
+			return out[i].ImportedName < out[j].ImportedName
+		}
+		return out[i].ImportPath < out[j].ImportPath
+	})
+	return out
+}
+
+func resolveImportedSymbol(baseFile, importPath, importedName string, tscp *config.TsConfigPaths) (types.ResolvedSymbolDependency, error) {
+	importPath = strings.TrimSpace(importPath)
+	importedName = strings.TrimSpace(importedName)
+	if importPath == "" || importedName == "" {
+		return types.ResolvedSymbolDependency{}, fmt.Errorf("import path or imported symbol is empty")
+	}
+
+	barrelFile := resolveImportFile(baseFile, importPath, tscp)
+	if barrelFile == "" {
+		return types.ResolvedSymbolDependency{}, fmt.Errorf("import path %s could not be resolved from %s", importPath, baseFile)
+	}
+	exportFile, exportName, err := traceExportedSymbol(barrelFile, importedName, tscp, make(map[string]struct{}), 0)
+	if err != nil {
+		return types.ResolvedSymbolDependency{}, err
+	}
+	kind, preferred := classifyResolvedSymbolDependency(importPath, importedName, exportFile, exportName)
+	return types.ResolvedSymbolDependency{
+		ImportPath:        importPath,
+		ImportedName:      importedName,
+		BarrelFile:        barrelFile,
+		ExportFile:        exportFile,
+		ExportName:        exportName,
+		DependencyKind:    kind,
+		IsSharedPreferred: preferred,
+	}, nil
+}
+
+func classifyResolvedSymbolDependency(importPath, importedName, exportFile, exportName string) (string, bool) {
+	lowerImportPath := strings.ToLower(strings.TrimSpace(importPath))
+	lowerExportPath := strings.ToLower(filepath.ToSlash(strings.TrimSpace(exportFile)))
+	name := strings.TrimSpace(importedName)
+	if name == "" {
+		name = strings.TrimSpace(exportName)
+	}
+
+	if strings.HasPrefix(lowerImportPath, "@testdata/") || strings.Contains(lowerExportPath, "/test_data/") {
+		return "shared_data", true
+	}
+	if strings.Contains(lowerExportPath, "/utils/") && (strings.HasSuffix(name, "Before") || strings.HasSuffix(name, "After")) {
+		return "shared_hook", true
+	}
+	if strings.Contains(lowerExportPath, "/module/") {
+		return "helper_class", false
+	}
+	return "local_module", false
+}
+
+func computeDependencyTargetPath(cfg *config.Config, sourceFile string) string {
+	sourceFile = strings.TrimSpace(sourceFile)
+	if sourceFile == "" || cfg == nil || strings.TrimSpace(cfg.Target.BaseDir) == "" || strings.TrimSpace(cfg.Source.Dir) == "" {
+		return sourceFile
+	}
+	sourceRoot := filepath.Clean(cfg.Source.Dir)
+	targetRoot := filepath.Clean(cfg.Target.BaseDir)
+	cleanSource := filepath.Clean(sourceFile)
+	rel, err := filepath.Rel(sourceRoot, cleanSource)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return cleanSource
+	}
+	return filepath.Join(targetRoot, rel)
+}
+
+func traceExportedSymbol(moduleFile, symbol string, tscp *config.TsConfigPaths, visited map[string]struct{}, depth int) (string, string, error) {
+	moduleFile = filepath.Clean(strings.TrimSpace(moduleFile))
+	symbol = strings.TrimSpace(symbol)
+	if moduleFile == "" || symbol == "" {
+		return "", "", fmt.Errorf("module file or symbol is empty")
+	}
+	if depth > 12 {
+		return "", "", fmt.Errorf("export trace depth exceeded for %s in %s", symbol, moduleFile)
+	}
+	if _, ok := visited[moduleFile]; ok {
+		return "", "", fmt.Errorf("cyclic export trace for %s at %s", symbol, moduleFile)
+	}
+	visited[moduleFile] = struct{}{}
+
+	sourceBytes, err := os.ReadFile(moduleFile)
+	if err != nil {
+		return "", "", fmt.Errorf("read export file %s: %w", moduleFile, err)
+	}
+	sourceText := string(sourceBytes)
+
+	if moduleDefinesExportedSymbol(sourceText, symbol) {
+		return moduleFile, symbol, nil
+	}
+	for _, reexport := range parseReExportEntries(sourceText) {
+		nextSymbol, ok := reexport.resolves(symbol)
+		if !ok {
+			continue
+		}
+		nextFile := resolveImportFile(moduleFile, reexport.ImportPath, tscp)
+		if nextFile == "" {
+			return "", "", fmt.Errorf("re-export path %s from %s could not be resolved", reexport.ImportPath, moduleFile)
+		}
+		return traceExportedSymbol(nextFile, nextSymbol, tscp, visited, depth+1)
+	}
+	if moduleContainsNamedExport(sourceText, symbol) {
+		return moduleFile, symbol, nil
+	}
+	return "", "", fmt.Errorf("exported symbol %s not found in %s", symbol, moduleFile)
+}
+
+type reExportEntry struct {
+	ImportPath string
+	ExportAll  bool
+	Names      map[string]string
+}
+
+func (e reExportEntry) resolves(requested string) (string, bool) {
+	requested = strings.TrimSpace(requested)
+	if requested == "" {
+		return "", false
+	}
+	if e.ExportAll {
+		return requested, true
+	}
+	if len(e.Names) == 0 {
+		return "", false
+	}
+	next, ok := e.Names[requested]
+	return next, ok
+}
+
+func parseReExportEntries(sourceText string) []reExportEntry {
+	var out []reExportEntry
+	exportAllRe := regexp.MustCompile(`(?m)^\s*export\s+\*\s+from\s+['"]([^'"]+)['"]`)
+	for _, match := range exportAllRe.FindAllStringSubmatch(sourceText, -1) {
+		if len(match) != 2 {
+			continue
+		}
+		out = append(out, reExportEntry{ImportPath: strings.TrimSpace(match[1]), ExportAll: true})
+	}
+
+	namedRe := regexp.MustCompile(`(?m)^\s*export\s*\{([^}]*)\}\s*from\s*['"]([^'"]+)['"]`)
+	for _, match := range namedRe.FindAllStringSubmatch(sourceText, -1) {
+		if len(match) != 3 {
+			continue
+		}
+		entry := reExportEntry{
+			ImportPath: strings.TrimSpace(match[2]),
+			Names:      make(map[string]string),
+		}
+		for _, item := range strings.Split(match[1], ",") {
+			item = strings.TrimSpace(item)
+			if item == "" {
+				continue
+			}
+			parts := strings.Fields(item)
+			switch {
+			case len(parts) == 1:
+				entry.Names[parts[0]] = parts[0]
+			case len(parts) >= 3 && strings.EqualFold(parts[1], "as"):
+				entry.Names[parts[len(parts)-1]] = parts[0]
+			}
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func moduleDefinesExportedSymbol(sourceText, symbol string) bool {
+	symbol = regexp.QuoteMeta(strings.TrimSpace(symbol))
+	patterns := []*regexp.Regexp{
+		regexp.MustCompile(`(?m)^\s*export\s+(?:const|let|var|async\s+function|function|class|enum|interface|type)\s+` + symbol + `\b`),
+		regexp.MustCompile(`(?m)^\s*export\s+default\s+class\s+` + symbol + `\b`),
+	}
+	for _, re := range patterns {
+		if re.MatchString(sourceText) {
+			return true
+		}
+	}
+	return false
+}
+
+func moduleContainsNamedExport(sourceText, symbol string) bool {
+	symbol = strings.TrimSpace(symbol)
+	if symbol == "" {
+		return false
+	}
+	namedLocalRe := regexp.MustCompile(`(?m)^\s*export\s*\{([^}]*)\}`)
+	for _, match := range namedLocalRe.FindAllStringSubmatch(sourceText, -1) {
+		if len(match) != 2 {
+			continue
+		}
+		for _, item := range strings.Split(match[1], ",") {
+			item = strings.TrimSpace(item)
+			if item == "" {
+				continue
+			}
+			parts := strings.Fields(item)
+			switch {
+			case len(parts) == 1 && parts[0] == symbol:
+				return true
+			case len(parts) >= 3 && strings.EqualFold(parts[1], "as") && parts[len(parts)-1] == symbol:
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func collectSharedDependencyImports(a *types.FullAnalysis, tscp *config.TsConfigPaths) map[string]string {
+	if a == nil || a.AST == nil {
+		return nil
+	}
+	out := make(map[string]string)
+	for _, dep := range a.ResolvedSymbolDeps {
+		if !dep.IsSharedPreferred {
+			continue
+		}
+		sourceFile := strings.TrimSpace(dep.ExportFile)
+		if sourceFile == "" {
+			continue
+		}
+		out[sourceFile] = strings.TrimSpace(dep.ImportPath)
+	}
+	for _, imp := range a.AST.Imports {
+		if !isLocalImportPath(imp.Path, tscp) {
+			continue
+		}
+		resolved := resolveImportFile(a.FilePath, imp.Path, tscp)
+		if resolved == "" {
+			continue
+		}
+		if !shouldPromoteSharedDependency(imp, resolved) {
+			continue
+		}
+		out[resolved] = strings.TrimSpace(imp.Path)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func shouldPromoteSharedDependency(imp types.ImportInfo, resolved string) bool {
+	importPath := strings.ToLower(strings.TrimSpace(imp.Path))
+	resolvedPath := strings.ToLower(filepath.ToSlash(strings.TrimSpace(resolved)))
+	importSpec := strings.TrimSpace(imp.Name)
+
+	if strings.HasPrefix(importPath, "@testdata/") {
+		return true
+	}
+	for _, marker := range []string{"/test_data/", "/mock/", "/mocks/", "mock-data"} {
+		if strings.Contains(resolvedPath, marker) || strings.Contains(importPath, marker) {
+			return true
+		}
+	}
+
+	if strings.Contains(importSpec, "Mock") {
+		return true
+	}
+	return false
 }
 
 func collectCandidateFuncNames(a *types.FullAnalysis) []string {
@@ -1469,6 +2310,77 @@ func methodDefinedInAnalysis(a *types.FullAnalysis, method string) bool {
 		}
 	}
 	return false
+}
+
+func helperMethodDefinedInModuleOrAncestors(moduleFile string, analysis *types.FullAnalysis, sourceText string, method string, tscp *config.TsConfigPaths, engine *analyzer.Engine) bool {
+	visited := make(map[string]struct{})
+	return helperMethodDefinedInModuleOrAncestorsRecursive(filepath.Clean(moduleFile), analysis, sourceText, method, tscp, engine, visited)
+}
+
+func helperMethodDefinedInModuleOrAncestorsRecursive(moduleFile string, analysis *types.FullAnalysis, sourceText string, method string, tscp *config.TsConfigPaths, engine *analyzer.Engine, visited map[string]struct{}) bool {
+	moduleFile = filepath.Clean(strings.TrimSpace(moduleFile))
+	if moduleFile == "" {
+		return false
+	}
+	if _, ok := visited[moduleFile]; ok {
+		return false
+	}
+	visited[moduleFile] = struct{}{}
+
+	if analysis == nil {
+		if engine == nil {
+			return false
+		}
+		var err error
+		analysis, err = engine.AnalyzeFile(moduleFile)
+		if err != nil {
+			return false
+		}
+	}
+	if sourceText == "" {
+		sourceBytes, err := os.ReadFile(moduleFile)
+		if err != nil {
+			return false
+		}
+		sourceText = string(sourceBytes)
+	}
+
+	if methodDefinedInAnalysis(analysis, method) || containsMethodDefinition(sourceText, method) {
+		return true
+	}
+
+	parentFile := resolveInheritedModuleFile(moduleFile, analysis, tscp)
+	if parentFile == "" {
+		return false
+	}
+	return helperMethodDefinedInModuleOrAncestorsRecursive(parentFile, nil, "", method, tscp, engine, visited)
+}
+
+func resolveInheritedModuleFile(moduleFile string, analysis *types.FullAnalysis, tscp *config.TsConfigPaths) string {
+	if analysis == nil || analysis.AST == nil {
+		return ""
+	}
+
+	if importPath := strings.TrimSpace(analysis.AST.ExtendsImport); importPath != "" {
+		if resolved := resolveImportFile(moduleFile, importPath, tscp); resolved != "" {
+			return resolved
+		}
+	}
+
+	parentClass := strings.TrimSpace(analysis.AST.ExtendsFrom)
+	if parentClass == "" {
+		return ""
+	}
+
+	roots := []string{filepath.Dir(moduleFile)}
+	if tscp != nil && strings.TrimSpace(tscp.ProjectRoot) != "" {
+		roots = append(roots, tscp.ProjectRoot)
+	}
+	hits := scanFilesByBaseName(uniqueStrings(roots), parentClass)
+	if len(hits) == 0 {
+		return ""
+	}
+	return hits[0]
 }
 
 func containsMethodDefinition(text string, method string) bool {

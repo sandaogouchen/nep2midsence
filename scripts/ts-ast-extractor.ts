@@ -62,6 +62,10 @@ interface FunctionInfo {
   bodyText: string;
   doc?: string;
   receiver?: string;
+  wrapperName?: string;
+  wrapperInjectedParams?: string[];
+  wrapperOptions?: string;
+  wrapperUrl?: string;
 }
 
 interface CallInfo {
@@ -117,6 +121,10 @@ interface TestEntry {
   endLine: number;
   calls: CallInfo[];
   isAsync: boolean;
+  wrapperName?: string;
+  wrapperInjectedParams?: string[];
+  wrapperOptions?: string;
+  wrapperUrl?: string;
 }
 
 interface DescribeBlock {
@@ -328,6 +336,87 @@ function collectCalls(node: ts.Node, src: ts.SourceFile, sourceText: string): Ca
   return calls;
 }
 
+
+// ── commonIt Wrapper Detection ─────────────────────────────────────────────────
+interface WrapperInfo {
+  wrapperName: string;
+  wrapperInjectedParams: string[];
+  wrapperOptions: string;
+  wrapperUrl: string;
+}
+
+/**
+ * Detect if a call expression like `commonIt("name", { url, pageObjects }, (params) => { ... })`
+ * is a wrapper call. Returns WrapperInfo if detected, null otherwise.
+ */
+function detectCommonItWrapper(callExpr: ts.CallExpression, src: ts.SourceFile): WrapperInfo | null {
+  const callee = calleeText(callExpr, src);
+  const method = terminalMethodName(callee);
+  // Only detect wrapper for it/test-like calls with 3+ args (name, options, callback)
+  if (method === "it" || method === "test") return null; // standard it/test, not a wrapper
+  // The wrapper call must have at least 2 args (name, callback) or 3 args (name, options, callback)
+  if (callExpr.arguments.length < 2) return null;
+
+  // Check if last arg is a function (callback)
+  const lastArg = callExpr.arguments[callExpr.arguments.length - 1];
+  if (!ts.isArrowFunction(lastArg) && !ts.isFunctionExpression(lastArg)) return null;
+
+  // Check if first arg is a string (test name)
+  const firstArg = callExpr.arguments[0];
+  if (!ts.isStringLiteral(firstArg) && !ts.isNoSubstitutionTemplateLiteral(firstArg)) return null;
+
+  // This looks like a wrapper: wrapperName(testName, [options], callback)
+  const wrapperName = method;
+
+  // Extract injected params from the callback's parameter destructuring
+  const callbackFn = lastArg as ts.ArrowFunction | ts.FunctionExpression;
+  const injectedParams: string[] = [];
+  if (callbackFn.parameters.length > 0) {
+    const param = callbackFn.parameters[0];
+    if (ts.isObjectBindingPattern(param.name)) {
+      for (const element of param.name.elements) {
+        injectedParams.push(element.name.getText(src));
+      }
+    } else {
+      injectedParams.push(param.name.getText(src));
+    }
+  }
+
+  // Extract options object (second arg if 3+ args)
+  let wrapperOptions = "";
+  let wrapperUrl = "";
+  if (callExpr.arguments.length >= 3) {
+    const optionsArg = callExpr.arguments[1];
+    wrapperOptions = optionsArg.getText(src);
+    // Try to extract url from options object literal
+    if (ts.isObjectLiteralExpression(optionsArg)) {
+      for (const prop of optionsArg.properties) {
+        if (ts.isPropertyAssignment(prop) && prop.name.getText(src) === "url") {
+          wrapperUrl = prop.initializer.getText(src);
+        }
+      }
+    }
+  }
+
+  return { wrapperName, wrapperInjectedParams: injectedParams, wrapperOptions, wrapperUrl };
+}
+
+/**
+ * Resolve the callback body from a wrapper call or standard it/test call.
+ * For wrapper calls like commonIt("name", opts, (params) => { body }),
+ * returns the inner callback body.
+ */
+function resolveTestCallbackBody(callExpr: ts.CallExpression, src: ts.SourceFile): ts.Node | undefined {
+  // Try last argument first (wrapper pattern: name, opts, callback)
+  for (let i = callExpr.arguments.length - 1; i >= 0; i--) {
+    const arg = callExpr.arguments[i];
+    if (ts.isArrowFunction(arg) || ts.isFunctionExpression(arg)) {
+      return arg.body;
+    }
+  }
+  return undefined;
+}
+
 // ── Test Structure Builder ─────────────────────────────────────────────────────
 function buildDescribe(
   node: ts.CallExpression, src: ts.SourceFile, sourceText: string
@@ -363,6 +452,23 @@ function buildDescribe(
         calls: cbBody ? collectCalls(cbBody, src, sourceText) : [],
         isAsync: callbackIsAsync(expr),
       });
+    } else if (!TEST_HOOKS.has(method)) {
+      // Possible wrapper call (e.g., commonIt)
+      const wrapperInfo = detectCommonItWrapper(expr, src);
+      if (wrapperInfo) {
+        const cbBody = resolveTestCallbackBody(expr, src);
+        block.tests.push({
+          name: firstStringArg(expr),
+          startLine: lineOf(src, expr.getStart()),
+          endLine: lineOf(src, expr.getEnd()),
+          calls: cbBody ? collectCalls(cbBody, src, sourceText) : [],
+          isAsync: callbackIsAsync(expr),
+          wrapperName: wrapperInfo.wrapperName,
+          wrapperInjectedParams: wrapperInfo.wrapperInjectedParams,
+          wrapperOptions: wrapperInfo.wrapperOptions,
+          wrapperUrl: wrapperInfo.wrapperUrl,
+        });
+      }
     } else if (TEST_HOOKS.has(method)) {
       const hookBody = callbackBody(expr);
       const hookBlock: HookBlock = {
@@ -417,20 +523,27 @@ function extractParams(
 function flattenDescribeTests(describes: DescribeBlock[], out: FunctionInfo[]) {
   for (const d of describes) {
     for (const t of d.tests) {
-      out.push({
+      const fi: FunctionInfo = {
         name: t.name,
         isAsync: t.isAsync,
         isExported: false,
         isTest: true,
         isHelper: false,
-        testType: "it",
+        testType: t.wrapperName || "it",
         params: [],
         startLine: t.startLine,
         endLine: t.endLine,
         bodyText: "",
         doc: "",
         receiver: "",
-      });
+      };
+      if (t.wrapperName) {
+        fi.wrapperName = t.wrapperName;
+        fi.wrapperInjectedParams = t.wrapperInjectedParams;
+        fi.wrapperOptions = t.wrapperOptions;
+        fi.wrapperUrl = t.wrapperUrl;
+      }
+      out.push(fi);
     }
     flattenDescribeTests(d.nestedDescribes, out);
   }
@@ -631,6 +744,30 @@ function analyseFile(filePath: string): FileAnalysis {
           doc: "",
           receiver: "",
         });
+      } else {
+        // Possible wrapper call at top level (e.g., commonIt)
+        const wrapperInfo = detectCommonItWrapper(stmt.expression, src);
+        if (wrapperInfo) {
+          const cbBody = resolveTestCallbackBody(stmt.expression, src);
+          functions.push({
+            name: firstStringArg(stmt.expression),
+            isAsync: callbackIsAsync(stmt.expression),
+            isExported: false,
+            isTest: true,
+            isHelper: false,
+            testType: wrapperInfo.wrapperName,
+            params: [],
+            startLine: lineOf(src, stmt.getStart()),
+            endLine: lineOf(src, stmt.getEnd()),
+            bodyText: cbBody ? bodyTextOf(cbBody, sourceText) : "",
+            doc: "",
+            receiver: "",
+            wrapperName: wrapperInfo.wrapperName,
+            wrapperInjectedParams: wrapperInfo.wrapperInjectedParams,
+            wrapperOptions: wrapperInfo.wrapperOptions,
+            wrapperUrl: wrapperInfo.wrapperUrl,
+          });
+        }
       }
     }
   }

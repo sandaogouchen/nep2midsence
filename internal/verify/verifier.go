@@ -23,9 +23,6 @@ func NewVerifier(projectDir, buildCmd, testCmd string) *Verifier {
 	if buildCmd == "" {
 		buildCmd = "go build"
 	}
-	if testCmd == "" {
-		testCmd = "go test"
-	}
 	return &Verifier{
 		projectDir: projectDir,
 		buildCmd:   buildCmd,
@@ -41,10 +38,10 @@ func (v *Verifier) Verify(result *types.MigrationResult) *types.VerifyResult {
 	vr.NepCleanOK, vr.NepCleanError = CheckNepClean(result.TargetFile)
 
 	// 1. Compile check
-	vr.CompileOK, vr.CompileError = v.checkCompile(result.TargetFile)
+	vr.CompileOK, vr.CompileError = v.CheckCompile(result.TargetFile)
 
-	// 2. Test run (only if compiles)
-	if vr.CompileOK && result.TargetFile != "" {
+	// 2. Test run (only if compiles and test execution is enabled)
+	if vr.CompileOK && result.TargetFile != "" && strings.TrimSpace(v.testCmd) != "" {
 		vr.TestOK, vr.TestError = v.runTest(result.TargetFile)
 	}
 
@@ -74,6 +71,10 @@ func (v *Verifier) VerifyAll(results []*types.MigrationResult) []*types.VerifyRe
 	return verifyResults
 }
 
+func (v *Verifier) CheckCompile(targetFile string) (bool, string) {
+	return v.checkCompile(targetFile)
+}
+
 func (v *Verifier) checkCompile(targetFile string) (bool, string) {
 	if targetFile == "" {
 		return false, "no target file"
@@ -88,11 +89,13 @@ func (v *Verifier) checkCompile(targetFile string) (bool, string) {
 	cmd := exec.Command(parts[0], args...)
 	cmd.Dir = v.projectDir
 
+	var stdout bytes.Buffer
 	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		output := stderr.String()
+		output := stdout.String() + stderr.String()
 		if strings.TrimSpace(output) == "" {
 			output = err.Error()
 		}
@@ -228,6 +231,8 @@ func suggestReplacementForMissingModule(moduleName string) string {
 		return "Suggestion: provide MidInput compatibility exports for Input-based components."
 	case strings.Contains(moduleName, "Switch"):
 		return "Suggestion: provide MidSwitch compatibility exports for Switch-based components."
+	case strings.HasPrefix(moduleName, "@testData/"), strings.HasPrefix(moduleName, "@utils/"), strings.HasPrefix(moduleName, "@pages/"), strings.HasPrefix(moduleName, "@constants/"), strings.HasPrefix(moduleName, "@conf/"):
+		return "Suggestion: source-local alias import leaked into cross-repo output; read the source dependency and inline the minimal exported constants/mock/helper code, or rewrite the import to a target-local resolvable file."
 	default:
 		return ""
 	}

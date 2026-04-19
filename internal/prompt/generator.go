@@ -29,6 +29,8 @@ type PromptData struct {
 	TargetFile        string
 	TaskKind          string
 	RelatedFiles      []string
+	LocalImportDeps   []LocalImportDepEntry
+	SharedSymbolDeps  []SharedSymbolDepEntry
 	ReferenceDocs     []string
 	APIMappings       []MappingEntry
 	OperationSteps    []OperationStep
@@ -46,6 +48,12 @@ type PromptData struct {
 	IsCrossRepo       bool
 	SourceRepoRoot    string
 	TargetRepoRoot    string
+
+	// commonIt wrapper fields (FR-3)
+	HasCommonItWrapper         bool
+	WrapperInjectedPageObjects []string
+	WrapperUrl                 string
+	WrapperOptions             string
 }
 
 type MappingEntry struct {
@@ -69,15 +77,31 @@ type HelperPlanEntry struct {
 }
 
 type UnresolvedHelperEntry struct {
-	Receiver string
-	Method   string
-	Reason   string
+	Receiver          string
+	Method            string
+	Reason            string
+	ReceiverReachable bool
 }
 
 type DefaultPromptEntry struct {
 	ClassName   string
 	PromptValue string
 	FilePath    string
+}
+
+type LocalImportDepEntry struct {
+	ImportPath string
+	ImportSpec string
+	SourceFile string
+}
+
+type SharedSymbolDepEntry struct {
+	ImportedName   string
+	ImportPath     string
+	ImportSpec     string
+	ExportFile     string
+	TargetFile     string
+	DependencyKind string
 }
 
 type DataFlowEntry struct {
@@ -117,7 +141,8 @@ func NewGenerator(cfg *config.Config) *Generator {
 
 	// Parse template
 	funcMap := template.FuncMap{
-		"add": func(a, b int) int { return a + b },
+		"add":      func(a, b int) int { return a + b },
+		"contains": strings.Contains,
 	}
 	g.tmpl = template.Must(template.New("migration").Funcs(funcMap).Parse(migrationTemplate))
 
@@ -253,9 +278,23 @@ func (g *Generator) buildPromptData(analysis *types.FullAnalysis) *PromptData {
 	}
 	for _, item := range analysis.UnresolvedHelpers {
 		data.UnresolvedHelpers = append(data.UnresolvedHelpers, UnresolvedHelperEntry{
-			Receiver: item.Receiver,
-			Method:   item.Method,
-			Reason:   item.Reason,
+			Receiver:          item.Receiver,
+			Method:            item.Method,
+			Reason:            item.Reason,
+			ReceiverReachable: item.ReceiverReachable,
+		})
+	}
+	for _, dep := range analysis.ResolvedSymbolDeps {
+		if !dep.IsSharedPreferred {
+			continue
+		}
+		data.SharedSymbolDeps = append(data.SharedSymbolDeps, SharedSymbolDepEntry{
+			ImportedName:   dep.ImportedName,
+			ImportPath:     dep.ImportPath,
+			ImportSpec:     dep.ImportSpec,
+			ExportFile:     dep.ExportFile,
+			TargetFile:     dep.TargetFile,
+			DependencyKind: dep.DependencyKind,
 		})
 	}
 
@@ -308,7 +347,29 @@ func (g *Generator) buildPromptData(analysis *types.FullAnalysis) *PromptData {
 	if analysis.Dependencies != nil {
 		data.RelatedFiles = append(data.RelatedFiles, analysis.Dependencies...)
 	}
+	data.LocalImportDeps = g.buildLocalImportDeps(analysis)
+	for _, dep := range data.LocalImportDeps {
+		data.RelatedFiles = append(data.RelatedFiles, dep.SourceFile)
+	}
 	data.RelatedFiles = uniqueNonEmpty(data.RelatedFiles)
+
+	// FR-3: Detect commonIt wrapper and populate fields
+	if analysis.AST != nil {
+		for _, fn := range analysis.AST.Functions {
+			if fn.WrapperName != "" && fn.IsTest {
+				data.HasCommonItWrapper = true
+				data.WrapperUrl = fn.WrapperUrl
+				data.WrapperOptions = fn.WrapperOptions
+				// Collect wrapper-injected page objects (params that are NOT page/midscene)
+				for _, p := range fn.WrapperInjectedParams {
+					if p != "page" && p != "midscene" && p != "agent" {
+						data.WrapperInjectedPageObjects = append(data.WrapperInjectedPageObjects, p)
+					}
+				}
+				break // use first wrapper test found
+			}
+		}
+	}
 
 	// Build constraints
 	data.Constraints = []string{
@@ -335,11 +396,30 @@ func (g *Generator) buildPromptData(analysis *types.FullAnalysis) *PromptData {
 			"保持原文件骨架和已有代码，仅补充这些方法所需的最小 import、字段和实例化依赖",
 		)
 	}
+	if analysis.TaskKind == "dependency" {
+		data.Constraints = append(data.Constraints,
+			"这是一个共享依赖迁移任务：将该源依赖文件迁移到目标路径，供多个 case 复用；不要把同一个 mock/常量在每个 case 内重复内联",
+			"迁移前先检查目标文件是否已经存在且内容可复用；若已迁移则保持现状，不要重复生成等价副本",
+			"若文件不含 NEP 逻辑，不要强行改写为 Midscene，只需保留当前依赖文件对 case 生效所需的最小 export / import 结构",
+		)
+	}
 	if len(data.UnresolvedHelpers) > 0 {
 		for _, item := range data.UnresolvedHelpers {
-			data.Constraints = append(data.Constraints,
-				fmt.Sprintf("未解析 helper 依赖：保留原调用，并在调用前添加 TODO 注释：// TODO(nep2midsence): helper dependency not migrated: %s.%s；原因：%s", item.Receiver, item.Method, item.Reason))
+			if item.ReceiverReachable {
+				// FR-5: Reachable receiver — instruct to create Midscene version
+				data.Constraints = append(data.Constraints,
+					fmt.Sprintf("可达 helper 依赖（receiver 在目标仓库可定位）：为 %s.%s 新建 Midscene 版本重写函数（%sMidscene），case 中调用新函数；原因：%s", item.Receiver, item.Method, item.Method, item.Reason))
+			} else {
+				// FR-5: Unreachable receiver — preserve original call with TODO
+				data.Constraints = append(data.Constraints,
+					fmt.Sprintf("不可达 helper 依赖：保留原调用 %s.%s，并在调用前添加 TODO 注释：// ⚠️⚠️⚠️TODO(nep2midsence): helper dependency not migrated: %s.%s；原因：%s", item.Receiver, item.Method, item.Receiver, item.Method, item.Reason))
+			}
 		}
+	}
+	if len(data.SharedSymbolDeps) > 0 {
+		data.Constraints = append(data.Constraints,
+			"共享符号依赖不得在 case 内重定义；必须从迁移后的共享依赖文件 import",
+			"若共享符号来自源仓库 barrel import，必须改写为目标仓库内可解析的 concrete migrated dependency import")
 	}
 
 	// Cross-repo mode: inject additional constraints
@@ -353,6 +433,7 @@ func (g *Generator) buildPromptData(analysis *types.FullAnalysis) *PromptData {
 			"从源仓库 Read 源文件，将迁移结果写入目标仓库对应路径；目标目录不存在时自动创建",
 			"输出文件中不得残留任何 NEP 相关 import 或调用（ai.action、ai?.action、from 'nep'、AiAgent 等）",
 			"仅修改 NEP/ai/AiAgent 相关代码，Pagepass 业务逻辑、selector 操作、工具函数等保持不变",
+			"跨仓库时，源仓库本地 alias / 相对依赖（尤其 @testData/*、@utils/*、@pages/* 等）不能直接原样保留到目标仓库；若目标仓库不存在同名模块，必须 Read 源依赖后把当前文件实际用到的常量、enum、mock 数据或小型 helper 做最小化内联，或改写为目标仓库内可解析的本地依赖",
 		)
 	}
 
@@ -375,6 +456,58 @@ func uniqueNonEmpty(items []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func (g *Generator) buildLocalImportDeps(analysis *types.FullAnalysis) []LocalImportDepEntry {
+	if analysis == nil || analysis.AST == nil {
+		return nil
+	}
+
+	var tscp *config.TsConfigPaths
+	if tsconfigPath := findNearestPromptTSConfig(analysis.FilePath); tsconfigPath != "" {
+		if loaded, err := config.LoadTsConfig(tsconfigPath); err == nil {
+			tscp = loaded
+		}
+	}
+
+	seen := make(map[string]struct{})
+	var deps []LocalImportDepEntry
+	for _, imp := range analysis.AST.Imports {
+		resolved := resolvePromptImportFile(analysis.FilePath, imp.Path, tscp)
+		if resolved == "" {
+			// FR-4: alias resolution failed — still record the dependency with empty SourceFile
+			// so the prompt can warn Coco about unresolvable cross-repo aliases
+			if tscp != nil && tscp.CanResolve(imp.Path) {
+				key := strings.TrimSpace(imp.Path) + "||" + strings.TrimSpace(imp.Name)
+				if _, ok := seen[key]; !ok {
+					seen[key] = struct{}{}
+					deps = append(deps, LocalImportDepEntry{
+						ImportPath: strings.TrimSpace(imp.Path),
+						ImportSpec: strings.TrimSpace(imp.Name),
+						SourceFile: "(unresolved alias — target repo may not have this module)",
+					})
+				}
+			}
+			continue
+		}
+		key := strings.TrimSpace(imp.Path) + "|" + filepath.Clean(resolved) + "|" + strings.TrimSpace(imp.Name)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		deps = append(deps, LocalImportDepEntry{
+			ImportPath: strings.TrimSpace(imp.Path),
+			ImportSpec: strings.TrimSpace(imp.Name),
+			SourceFile: filepath.Clean(resolved),
+		})
+	}
+	sort.Slice(deps, func(i, j int) bool {
+		if deps[i].ImportPath == deps[j].ImportPath {
+			return deps[i].SourceFile < deps[j].SourceFile
+		}
+		return deps[i].ImportPath < deps[j].ImportPath
+	})
+	return deps
 }
 
 func buildWrapperMidsceneCall(step types.CallStep) string {
@@ -424,6 +557,41 @@ func detectCodeFenceLanguage(filePath, language string) string {
 	default:
 		return "go"
 	}
+}
+
+func findNearestPromptTSConfig(filePath string) string {
+	cur := filepath.Dir(filePath)
+	for cur != "" {
+		candidate := filepath.Join(cur, "tsconfig.json")
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+	return ""
+}
+
+func resolvePromptImportFile(baseFile, importPath string, tscp *config.TsConfigPaths) string {
+	importPath = strings.TrimSpace(importPath)
+	if importPath == "" {
+		return ""
+	}
+	if strings.HasPrefix(importPath, ".") {
+		return resolveLocalImportFile(baseFile, importPath)
+	}
+	if tscp != nil && tscp.CanResolve(importPath) {
+		for _, candidate := range tscp.Resolve(importPath) {
+			info, err := os.Stat(candidate)
+			if err == nil && !info.IsDir() {
+				return candidate
+			}
+		}
+	}
+	return ""
 }
 
 func (g *Generator) buildRelatedCode(analysis *types.FullAnalysis) string {
@@ -757,4 +925,123 @@ func (g *Generator) GenerateNepFixPrompt(targetFile string, nepMarkers string, a
 2. 确保修改后文件语法正确，import 完整
 3. 不要新增任何不必要的代码
 `, attempt, targetFile, nepMarkers, targetFile, targetFile)
+}
+
+// GenerateCompileFixPrompt creates a targeted prompt for repairing compiler
+// errors after the initial migration and NEP cleanup passes have finished.
+func (g *Generator) GenerateCompileFixPrompt(analysis *types.FullAnalysis, targetFile string, compileError string, attempt int) string {
+	var extra strings.Builder
+
+	if analysis != nil {
+		relatedFiles := uniqueNonEmpty(append([]string{analysis.FilePath}, analysis.Dependencies...))
+		localDeps := g.buildLocalImportDeps(analysis)
+		wrapperInjected := collectWrapperInjectedPageObjects(analysis)
+
+		if len(relatedFiles) > 0 || len(localDeps) > 0 || len(wrapperInjected) > 0 || len(analysis.UnresolvedHelpers) > 0 {
+			extra.WriteString("\n---\n\n### 附加上下文\n\n")
+		}
+
+		if len(relatedFiles) > 0 {
+			extra.WriteString("#### 相关文件（先 Read 再修）\n\n")
+			for _, file := range relatedFiles {
+				extra.WriteString("- `" + file + "`\n")
+			}
+			extra.WriteString("\n")
+		}
+
+		if len(localDeps) > 0 {
+			extra.WriteString("#### 源文件本地依赖 import\n\n")
+			extra.WriteString("| import path | 当前文件实际引用 | 源文件 |\n")
+			extra.WriteString("|---|---|---|\n")
+			for _, dep := range localDeps {
+				extra.WriteString(fmt.Sprintf("| `%s` | `%s` | `%s` |\n", dep.ImportPath, dep.ImportSpec, dep.SourceFile))
+			}
+			extra.WriteString("\n")
+		}
+
+		if len(wrapperInjected) > 0 {
+			extra.WriteString("#### Wrapper 注入参数\n\n")
+			extra.WriteString("这些参数来自 commonIt/wrapper 运行时注入，不是真实 import 依赖：\n")
+			for _, name := range wrapperInjected {
+				extra.WriteString("- `" + name + "`\n")
+			}
+			extra.WriteString("\n缺少这些符号时，不要在 case 中伪造 `const x: any = {}`、`async () => null` 一类占位对象；应当导入或实例化真实 page object / helper。\n\n")
+		}
+
+		if len(analysis.UnresolvedHelpers) > 0 {
+			extra.WriteString("#### Helper 依赖状态\n\n")
+			extra.WriteString("| receiver | method | reason | 可达性 |\n")
+			extra.WriteString("|---|---|---|---|\n")
+			for _, item := range analysis.UnresolvedHelpers {
+				reachability := "不可达"
+				if item.ReceiverReachable {
+					reachability = "可达"
+				}
+				extra.WriteString(fmt.Sprintf("| `%s` | `%s` | %s | %s |\n", item.Receiver, item.Method, item.Reason, reachability))
+			}
+			extra.WriteString("\n")
+		}
+	}
+
+	return fmt.Sprintf(`## 编译失败修复任务（第 %d 次修正）
+
+**严格按照以下指令执行，不要做额外的事情。**
+
+---
+
+### 问题描述
+
+文件 `+"`%s`"+` 当前编译失败，编译器输出如下：
+
+`+"```\n%s\n```"+`
+
+你必须以这些编译错误为准修复目标文件，确保文件最终可被当前仓库编译器通过。
+
+---
+
+### 操作步骤
+
+1. **Read** 目标文件 `+"`%s`"+`
+2. **根据编译报错修复代码**，优先处理语法、类型、import、导出、符号缺失、调用签名不匹配等问题
+3. **如果是依赖缺失**：
+   - 依赖缺失时，必须迁移或替换依赖；必要时可以改写缺失依赖
+   - 这类依赖不一定是 NEP 依赖，也可能是普通本地依赖、alias 依赖或跨仓库依赖
+   - 若目标仓库没有同名模块，必须把当前文件实际用到的最小实现迁移进来，或改写为目标仓库内可解析的本地依赖
+4. **Write** 修正后的完整文件到原路径 `+"`%s`"+`
+%s
+
+---
+
+### 约束
+
+1. 只修复与编译失败直接相关的问题，不要做无关重构
+2. 不需要运行测试，只需要确保编译通过
+3. 尽量保持业务逻辑不变
+4. 不要保留会导致当前仓库无法解析的 import
+5. 不要通过定义假的占位对象、假的 page object、`+"`"+`any`+"`"+` 空壳、`+"`"+`async () => null`+"`"+`、空实现函数来消除编译报错
+6. 如果缺少的是 wrapper 注入参数，必须导入或实例化真实对象，不要在 case 内伪造同名变量
+7. 如果 helper receiver 可达，优先迁移/补齐真实 helper 或改写调用；只有明确不可达时才允许保留 TODO
+`, attempt, targetFile, compileError, targetFile, targetFile, extra.String())
+}
+
+func collectWrapperInjectedPageObjects(analysis *types.FullAnalysis) []string {
+	if analysis == nil {
+		return nil
+	}
+
+	names := append([]string(nil), analysis.WrapperInjectedParams...)
+	if analysis.AST != nil {
+		for _, fn := range analysis.AST.Functions {
+			if !fn.IsTest || strings.TrimSpace(fn.WrapperName) == "" {
+				continue
+			}
+			for _, name := range fn.WrapperInjectedParams {
+				if name == "page" || name == "midscene" || name == "agent" {
+					continue
+				}
+				names = append(names, name)
+			}
+		}
+	}
+	return uniqueNonEmpty(names)
 }
