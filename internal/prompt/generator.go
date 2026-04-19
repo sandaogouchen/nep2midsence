@@ -47,6 +47,12 @@ type PromptData struct {
 	IsCrossRepo       bool
 	SourceRepoRoot    string
 	TargetRepoRoot    string
+
+	// commonIt wrapper fields (FR-3)
+	HasCommonItWrapper       bool
+	WrapperInjectedPageObjects []string
+	WrapperUrl               string
+	WrapperOptions           string
 }
 
 type MappingEntry struct {
@@ -70,9 +76,10 @@ type HelperPlanEntry struct {
 }
 
 type UnresolvedHelperEntry struct {
-	Receiver string
-	Method   string
-	Reason   string
+	Receiver          string
+	Method            string
+	Reason            string
+	ReceiverReachable bool
 }
 
 type DefaultPromptEntry struct {
@@ -125,6 +132,7 @@ func NewGenerator(cfg *config.Config) *Generator {
 	// Parse template
 	funcMap := template.FuncMap{
 		"add": func(a, b int) int { return a + b },
+		"contains": strings.Contains,
 	}
 	g.tmpl = template.Must(template.New("migration").Funcs(funcMap).Parse(migrationTemplate))
 
@@ -260,9 +268,10 @@ func (g *Generator) buildPromptData(analysis *types.FullAnalysis) *PromptData {
 	}
 	for _, item := range analysis.UnresolvedHelpers {
 		data.UnresolvedHelpers = append(data.UnresolvedHelpers, UnresolvedHelperEntry{
-			Receiver: item.Receiver,
-			Method:   item.Method,
-			Reason:   item.Reason,
+			Receiver:          item.Receiver,
+			Method:            item.Method,
+			Reason:            item.Reason,
+			ReceiverReachable: item.ReceiverReachable,
 		})
 	}
 
@@ -321,6 +330,24 @@ func (g *Generator) buildPromptData(analysis *types.FullAnalysis) *PromptData {
 	}
 	data.RelatedFiles = uniqueNonEmpty(data.RelatedFiles)
 
+	// FR-3: Detect commonIt wrapper and populate fields
+	if analysis.AST != nil {
+		for _, fn := range analysis.AST.Functions {
+			if fn.WrapperName != "" && fn.IsTest {
+				data.HasCommonItWrapper = true
+				data.WrapperUrl = fn.WrapperUrl
+				data.WrapperOptions = fn.WrapperOptions
+				// Collect wrapper-injected page objects (params that are NOT page/midscene)
+				for _, p := range fn.WrapperInjectedParams {
+					if p != "page" && p != "midscene" && p != "agent" {
+						data.WrapperInjectedPageObjects = append(data.WrapperInjectedPageObjects, p)
+					}
+				}
+				break // use first wrapper test found
+			}
+		}
+	}
+
 	// Build constraints
 	data.Constraints = []string{
 		fmt.Sprintf("将迁移后的代码写入: %s", analysis.TargetPath),
@@ -348,8 +375,15 @@ func (g *Generator) buildPromptData(analysis *types.FullAnalysis) *PromptData {
 	}
 	if len(data.UnresolvedHelpers) > 0 {
 		for _, item := range data.UnresolvedHelpers {
-			data.Constraints = append(data.Constraints,
-				fmt.Sprintf("未解析 helper 依赖：保留原调用，并在调用前添加 TODO 注释：// TODO(nep2midsence): helper dependency not migrated: %s.%s；原因：%s", item.Receiver, item.Method, item.Reason))
+			if item.ReceiverReachable {
+				// FR-5: Reachable receiver — instruct to create Midscene version
+				data.Constraints = append(data.Constraints,
+					fmt.Sprintf("可达 helper 依赖（receiver 在目标仓库可定位）：为 %s.%s 新建 Midscene 版本重写函数（%sMidscene），case 中调用新函数；原因：%s", item.Receiver, item.Method, item.Method, item.Reason))
+			} else {
+				// FR-5: Unreachable receiver — preserve original call with TODO
+				data.Constraints = append(data.Constraints,
+					fmt.Sprintf("不可达 helper 依赖：保留原调用 %s.%s，并在调用前添加 TODO 注释：// TODO(nep2midsence): helper dependency not migrated: %s.%s；原因：%s", item.Receiver, item.Method, item.Receiver, item.Method, item.Reason))
+			}
 		}
 	}
 
@@ -406,6 +440,19 @@ func (g *Generator) buildLocalImportDeps(analysis *types.FullAnalysis) []LocalIm
 	for _, imp := range analysis.AST.Imports {
 		resolved := resolvePromptImportFile(analysis.FilePath, imp.Path, tscp)
 		if resolved == "" {
+			// FR-4: alias resolution failed — still record the dependency with empty SourceFile
+			// so the prompt can warn Coco about unresolvable cross-repo aliases
+			if tscp != nil && tscp.CanResolve(imp.Path) {
+				key := strings.TrimSpace(imp.Path) + "||" + strings.TrimSpace(imp.Name)
+				if _, ok := seen[key]; !ok {
+					seen[key] = struct{}{}
+					deps = append(deps, LocalImportDepEntry{
+						ImportPath: strings.TrimSpace(imp.Path),
+						ImportSpec: strings.TrimSpace(imp.Name),
+						SourceFile: "(unresolved alias — target repo may not have this module)",
+					})
+				}
+			}
 			continue
 		}
 		key := strings.TrimSpace(imp.Path) + "|" + filepath.Clean(resolved) + "|" + strings.TrimSpace(imp.Name)

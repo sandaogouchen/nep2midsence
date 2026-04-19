@@ -31,6 +31,10 @@ type FullAnalysis struct {
 	// original call and add TODO annotations instead of forcing whole-file helper
 	// migration.
 	UnresolvedHelpers []UnresolvedHelper `json:"unresolved_helpers,omitempty"`
+
+	// WrapperInjectedParams lists parameter names injected by the wrapper (e.g., commonIt).
+	// These are fake dependencies that should NOT be migrated as real imports.
+	WrapperInjectedParams []string `json:"wrapper_injected_params,omitempty"`
 }
 
 // ASTInfo holds L1 AST structural analysis results
@@ -71,6 +75,12 @@ type FuncInfo struct {
 	LineEnd   int         `json:"line_end"`
 	Body      string      `json:"body"`
 	Receiver  string      `json:"receiver"`
+
+	// Wrapper fields: populated when the test is wrapped by commonIt or similar
+	WrapperName           string   `json:"wrapper_name,omitempty"`
+	WrapperInjectedParams []string `json:"wrapper_injected_params,omitempty"`
+	WrapperOptions        string   `json:"wrapper_options,omitempty"`
+	WrapperUrl            string   `json:"wrapper_url,omitempty"`
 }
 
 type ParamInfo struct {
@@ -128,7 +138,8 @@ type HelperMigrationPlan struct {
 }
 
 type UnresolvedHelper struct {
-	Receiver string `json:"receiver"`
-	Method   string `json:"method"`
-	Reason   string `json:"reason"`
+	Receiver         string `json:"receiver"`
+	Method           string `json:"method"`
+	Reason           string `json:"reason"`
+	ReceiverReachable bool  `json:"receiver_reachable,omitempty"`
 }

@@ -262,6 +262,89 @@ NEP `【】`/`[]` → Midscene `''`（单引号），语义保持一致即可。
 
 ---
 
+## 5.5 commonIt Wrapper 迁移规则
+
+### 什么是 commonIt
+
+`commonIt` 是 NEP E2E 测试中常见的测试封装函数，它包装了标准 `it`/`test`，自动完成：
+
+1. **URL 导航**：自动跳转到指定测试页面
+2. **Page Object 注入**：自动实例化并注入业务 Page Object（如 `listPage`、`createPage`）
+3. **参数解构**：回调函数通过参数解构接收 `{ page, ai, listPage, caseParams, ... }`
+
+```typescript
+// NEP 中的 commonIt 用法
+commonIt('创建广告', { url: '/campaign/create', pageObjects: [ListPage, CreatePage] }, 
+  async ({ page, ai, listPage, createPage, caseParams }) => {
+    // page, ai, listPage, createPage 都是 wrapper 自动注入的
+    await listPage.commonActions.clickCreate();
+    await ai?.action('点击[Continue]');
+  }
+);
+```
+
+### 迁移规则
+
+将 `commonIt` 迁移到标准 Midscene `it`/`test` 时：
+
+1. **替换 wrapper**：`commonIt(...)` → `it(...)` 或 `test(...)`
+2. **回调签名**：改为 `CaseFunctionParams<'test'>`，仅接收 `{ page, midscene }`
+3. **显式导航**：wrapper 自动执行的 URL 跳转需在 test body 开头手动补上：
+   ```typescript
+   await page.goto('/campaign/create');
+   ```
+4. **Page Object 实例化**：wrapper 注入的 Page Object 需自行创建：
+   ```typescript
+   const listPage = new ListPage(page);
+   const createPage = new CreatePage(page);
+   ```
+5. **删除 wrapper import**：移除对 `commonIt` 的 import 声明
+6. **识别假依赖**：`commonIt` 回调参数中解构出的变量（如 `listPage`、`caseParams`）是 wrapper 在运行时注入的，**不是真实的模块 import**。迁移时不要试图从其他文件 import 这些变量，而应按上述规则自行实例化或替换
+
+### 迁移示例
+
+**迁移前（NEP + commonIt）**：
+```typescript
+import { commonIt } from '@e2e/common';
+import { ListPage } from '@pages/ListPage';
+
+describe('Campaign', () => {
+  commonIt('编辑广告', { url: '/campaign/list' }, 
+    async ({ page, ai, listPage, caseParams }) => {
+      await listPage.commonActions.editCampaign(page, ai, caseParams.name);
+      await ai?.action('点击[Save]');
+    }
+  );
+});
+```
+
+**迁移后（Midscene 标准写法）**：
+```typescript
+import { MidsceneCaseFunctionParams } from '@byted-midscene/pagepass-plugin';
+import type { CaseFunctionParams } from '@pagepass/test';
+import { ListPage } from '@pages/ListPage';
+
+describe('Campaign', () => {
+  it('编辑广告', async (params: CaseFunctionParams<'test'>) => {
+    const { page } = params;
+    const { midscene } = params as MidsceneCaseFunctionParams;
+    const { agent } = midscene!;
+
+    // 1. 显式导航（原 wrapper 自动完成）
+    await page.goto('/campaign/list');
+
+    // 2. 手动实例化 Page Object（原 wrapper 自动注入）
+    const listPage = new ListPage(page);
+
+    // 3. 业务逻辑迁移
+    await listPage.commonActions.editCampaignMidscene(agent, caseParams.name);
+    await agent.aiTap("点击'Save'");
+  });
+});
+```
+
+---
+
 ## 六、迁移 Checklist
 
 1. **模板**：用上面「第零节」的标准 describe/it + 三行导入解构，取到 `agent`
