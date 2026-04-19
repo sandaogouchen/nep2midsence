@@ -96,7 +96,7 @@ type Model struct {
 func NewModel(cfg *config.Config, runtime Runtime, opts Options) Model {
 	input := textinput.New()
 	input.Placeholder = "/help"
-	input.Prompt = " / "
+	input.Prompt = " > "
 	input.Focus()
 	input.CharLimit = 512
 	input.Width = 80
@@ -127,7 +127,7 @@ func NewModel(cfg *config.Config, runtime Runtime, opts Options) Model {
 		commandInput:         input,
 		directoryList:        dirList,
 		directorySearchInput: dirSearch,
-		logs:                 []string{"欢迎使用 nep2midsence 全屏交互模式。"},
+		logs:                 nil,
 		currentDir:           opts.WorkDir,
 	}
 }
@@ -290,10 +290,48 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) View() string {
-	header := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render("nep2midsence")
+	header := m.renderHeader()
 	main := m.renderMain()
 	commandPanel := m.renderCommandPanel()
-	return strings.Join([]string{header, "", main, "", commandPanel}, "\n")
+	return strings.Join([]string{header, main, "", commandPanel}, "\n")
+}
+
+func (m Model) renderHeader() string {
+	contentWidth := maxInt(40, m.width-2)
+
+	// Brand
+	brand := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("15")).
+		Background(lipgloss.Color("62")).
+		Padding(0, 1).
+		Render(" nep2midsence ")
+
+	// Breadcrumb: show active view
+	viewLabel := string(m.activeView)
+	if m.activeView == viewHome {
+		viewLabel = "home"
+	}
+	breadcrumb := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("243")).
+		Render("  " + viewLabel)
+
+	// Right side: version badge
+	versionBadge := ""
+	if m.opts.Version != "" {
+		versionBadge = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("243")).
+			Render("v" + m.opts.Version)
+	}
+
+	left := brand + breadcrumb
+	headerLine := joinEdge(left, versionBadge, contentWidth)
+
+	divider := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("62")).
+		Render(strings.Repeat("━", contentWidth))
+
+	return headerLine + "\n" + divider
 }
 
 func (m Model) handleCommand() (tea.Model, tea.Cmd) {
@@ -594,45 +632,86 @@ func (m Model) visibleLogs() []string {
 
 func (m Model) renderRunningView() string {
 	contentWidth := maxInt(40, m.width-2)
-	stage := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81")).Render(strings.ToUpper(emptyFallback(m.currentStage, "queued")))
-	current := lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Render(emptyFallback(m.currentFile, "-"))
+
+	// Stage badge with colored background
+	stageName := strings.ToUpper(emptyFallback(m.currentStage, "queued"))
+	stageColors := map[string][2]string{
+		"QUEUED":      {"15", "243"},
+		"PREFLIGHT":   {"15", "208"},
+		"SCAN":        {"15", "214"},
+		"ANALYZE":     {"15", "33"},
+		"GENERATE":    {"15", "141"},
+		"EXECUTE":     {"15", "35"},
+		"VERIFY":      {"15", "81"},
+		"NEP-FIX":     {"15", "220"},
+		"COMPILE-FIX": {"15", "208"},
+		"COMPLETE":    {"15", "35"},
+	}
+	fg, bg := "15", "62"
+	if colors, ok := stageColors[stageName]; ok {
+		fg, bg = colors[0], colors[1]
+	}
+	stageBadge := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color(fg)).
+		Background(lipgloss.Color(bg)).
+		Padding(0, 1).
+		Render(stageName)
+
+	currentFile := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("252")).
+		Render(emptyFallback(m.currentFile, "-"))
+
 	var progressIndicator string
 	if m.currentStage == "scan" {
-		progressIndicator = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("⟳ scanning…")
+		progressIndicator = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("214")).
+			Bold(true).
+			Render("⟳ scanning…")
 	} else {
-		progressIndicator = renderProgressSummary(m.progressCurrent, m.progressTotal)
+		progressIndicator = renderProgressBar(m.progressCurrent, m.progressTotal, contentWidth/3)
 	}
-	header := joinEdge("Running "+stage+"  "+current, progressIndicator, contentWidth)
 
-	logs := strings.Join(m.visibleLogs(), "\n")
+	header := "Running " + stageBadge + "  " + currentFile
+	headerLine := joinEdge(header, progressIndicator, contentWidth)
+
+	// Log area
+	logLines := m.visibleLogs()
+	styledLines := make([]string, len(logLines))
+	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	successStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("35"))
+	failStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	skipStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+	for i, line := range logLines {
+		switch {
+		case strings.HasPrefix(line, "[成功]") || strings.HasPrefix(line, "[已迁移]") || strings.Contains(line, "success"):
+			styledLines[i] = successStyle.Render(line)
+		case strings.HasPrefix(line, "[失败]") || strings.Contains(line, "failed") || strings.Contains(line, "error"):
+			styledLines[i] = failStyle.Render(line)
+		case strings.HasPrefix(line, "[跳过]"):
+			styledLines[i] = skipStyle.Render(line)
+		default:
+			styledLines[i] = dimStyle.Render(line)
+		}
+	}
+	logs := strings.Join(styledLines, "\n")
 	if strings.TrimSpace(logs) == "" {
-		logs = "暂无日志"
+		logs = dimStyle.Render("暂无日志")
 	}
 
 	hint := lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Render("Scroll: Up/Down PgUp/PgDn Home/End")
 	stats := renderShiftStats(m.progressTotal, m.successes, m.failures)
 	footer := joinEdge(hint, stats, contentWidth)
-	divider := lipgloss.NewStyle().Foreground(lipgloss.Color("238")).Render(strings.Repeat("─", contentWidth))
 
-	return strings.Join([]string{header, divider, logs, divider, footer}, "\n")
+	thinDiv := lipgloss.NewStyle().Foreground(lipgloss.Color("238")).Render(strings.Repeat("─", contentWidth))
+
+	return strings.Join([]string{headerLine, thinDiv, logs, thinDiv, footer}, "\n")
 }
 
 func (m Model) renderMain() string {
 	switch m.activeView {
 	case viewHelp:
-		return strings.Join([]string{
-			"Available Commands",
-			"/help      Show help",
-			"/start     Select a directory and run the full workflow",
-			"/analyze   Select a directory and only analyze",
-			"/status    Show the latest persisted run state",
-			"/history   Show recent persisted runs",
-			"/config    View config; /config set <key> <value>; /config save",
-			"/model     Switch the external CLI tool: /model <coco|cc|codex>",
-			"/version   Show version metadata",
-			"/clear     Clear the session log",
-			"/quit      Exit the CLI",
-		}, "\n")
+		return m.renderHelpView()
 	case viewDirectory:
 		return fmt.Sprintf("%s\n\n%s", m.directorySearchInput.View(), m.directoryList.View())
 	case viewTargetDirectory:
@@ -642,14 +721,7 @@ func (m Model) renderMain() string {
 	case viewRunning:
 		return m.renderRunningView()
 	case viewResults:
-		if m.lastResult == nil {
-			return "No result yet."
-		}
-		if m.lastResult.Mode == "analyze" {
-			return fmt.Sprintf("Analyze Summary\nDirectory: %s\nCases found: %d", m.lastResult.Dir, len(m.lastResult.Analyses))
-		}
-		reporter := verify.NewReporter()
-		return reporter.FormatText(m.lastResult.Report)
+		return m.renderResultsView()
 	case viewStatus:
 		return renderStatus(m.statusSnapshot)
 	case viewHistory:
@@ -657,60 +729,225 @@ func (m Model) renderMain() string {
 	case viewConfig:
 		return renderConfig(m.cfg)
 	case viewVersion:
-		return fmt.Sprintf("nep2midsence %s\nBuild Date: %s\nGit Commit: %s", m.opts.Version, m.opts.BuildDate, m.opts.GitCommit)
+		return m.renderVersionView()
 	default:
-		return strings.Join(m.logs, "\n")
+		return m.renderHomeView()
 	}
 }
 
-func (m Model) renderCommandPanel() string {
-	hintStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
-	label := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("69")).Render("Command")
-	content := []string{
-		hintStyle.Render(strings.Repeat("─", maxInt(20, m.width-2))),
-		label + "  " + m.commandInput.View(),
-		hintStyle.Render("Slash commands: /help /start /analyze /status /history /config /model /version /clear /quit"),
+func (m Model) renderHomeView() string {
+	if len(m.logs) == 0 {
+		dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+		welcome := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("252")).
+			Bold(true).
+			Render("nep → midscene 自动化迁移引擎")
+		hint := dimStyle.Render("输入 /start 开始迁移流程，或输入 /help 查看所有命令。")
+		return "\n" + welcome + "\n\n" + hint + "\n"
 	}
+	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	lines := make([]string, len(m.logs))
+	for i, line := range m.logs {
+		lines[i] = dimStyle.Render(line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderHelpView() string {
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81"))
+	cmdStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("35")).Bold(true)
+	descStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+
+	commands := []struct{ cmd, desc string }{
+		{"/help", "Show help"},
+		{"/start", "Select a directory and run the full workflow"},
+		{"/analyze", "Select a directory and only analyze"},
+		{"/status", "Show the latest persisted run state"},
+		{"/history", "Show recent persisted runs"},
+		{"/config", "View config; /config set <key> <value>; /config save"},
+		{"/model", "Switch the external CLI tool: /model <coco|cc|codex>"},
+		{"/version", "Show version metadata"},
+		{"/clear", "Clear the session log"},
+		{"/quit", "Exit the CLI"},
+	}
+
+	lines := []string{
+		titleStyle.Render("Available Commands"),
+		"",
+	}
+	for _, c := range commands {
+		pad := strings.Repeat(" ", maxInt(0, 14-len(c.cmd)))
+		lines = append(lines, "  "+cmdStyle.Render(c.cmd)+pad+descStyle.Render(c.desc))
+	}
+	lines = append(lines, "", dimStyle.Render("  按任意键返回"))
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderResultsView() string {
+	if m.lastResult == nil {
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Render("No result yet.")
+	}
+	if m.lastResult.Mode == "analyze" {
+		titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81"))
+		labelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+		valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Bold(true)
+		return strings.Join([]string{
+			titleStyle.Render("Analyze Summary"),
+			"",
+			"  " + labelStyle.Render("Directory  ") + valueStyle.Render(m.lastResult.Dir),
+			"  " + labelStyle.Render("Cases found") + valueStyle.Render(fmt.Sprintf(" %d", len(m.lastResult.Analyses))),
+		}, "\n")
+	}
+	reporter := verify.NewReporter()
+	return reporter.FormatText(m.lastResult.Report)
+}
+
+func (m Model) renderVersionView() string {
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81"))
+	labelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+	valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Bold(true)
+	return strings.Join([]string{
+		titleStyle.Render("nep2midsence"),
+		"",
+		"  " + labelStyle.Render("Version    ") + valueStyle.Render(emptyFallback(m.opts.Version, "dev")),
+		"  " + labelStyle.Render("Build Date ") + valueStyle.Render(emptyFallback(m.opts.BuildDate, "unknown")),
+		"  " + labelStyle.Render("Git Commit ") + valueStyle.Render(emptyFallback(m.opts.GitCommit, "unknown")),
+	}, "\n")
+}
+
+func (m Model) renderCommandPanel() string {
+	contentWidth := maxInt(20, m.width-2)
+
+	divider := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("62")).
+		Render(strings.Repeat("━", contentWidth))
+
+	label := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("15")).
+		Background(lipgloss.Color("62")).
+		Padding(0, 1).
+		Render("Command")
+
+	inputLine := label + "  " + m.commandInput.View()
+
+	hintStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+	hint := hintStyle.Render("  /help /start /analyze /status /history /config /model /version /clear /quit")
+
+	content := []string{divider, inputLine, hint}
+
 	if m.lastError != "" {
-		content = append(content, lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render(m.lastError))
+		errStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("196")).
+			Bold(true)
+		content = append(content, "  "+errStyle.Render("! "+m.lastError))
 	}
 	if m.lastInfo != "" {
-		content = append(content, lipgloss.NewStyle().Foreground(lipgloss.Color("70")).Render(m.lastInfo))
+		infoStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("35"))
+		content = append(content, "  "+infoStyle.Render(m.lastInfo))
 	}
 
 	return strings.Join(content, "\n")
 }
 
 func renderConfig(cfg *config.Config) string {
-	lines := []string{"Current Config"}
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81"))
+	keyStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("35"))
+	valStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+
+	lines := []string{titleStyle.Render("Current Config"), ""}
 	for _, key := range cfg.GetAllKeys() {
 		value, err := cfg.Get(key)
 		if err != nil {
 			continue
 		}
-		lines = append(lines, fmt.Sprintf("%s = %v", key, value))
+		lines = append(lines, fmt.Sprintf("  %s %s %v",
+			keyStyle.Render(key),
+			dimStyle.Render("="),
+			valStyle.Render(fmt.Sprintf("%v", value))))
 	}
 	return strings.Join(lines, "\n")
 }
 
 func renderStatus(snapshot executor.StateSnapshot) string {
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81"))
+	labelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+	valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Bold(true)
+	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+
 	if snapshot.CurrentRun == nil {
-		return "暂无可展示的状态。先执行 /start。"
+		return dimStyle.Render("暂无可展示的状态。先执行 /start。")
 	}
 	run := snapshot.CurrentRun
-	return fmt.Sprintf("Latest Run\nID: %s\nDir: %s\nStatus: %s\nProgress: %d/%d\nSucceeded: %d\nFailed: %d\nCurrent file: %s",
-		run.ID, run.Dir, run.Status, run.Completed+run.Failed, run.TotalFiles, run.Completed, run.Failed, emptyFallback(run.CurrentFile, "-"))
+
+	statusColor := "243"
+	switch run.Status {
+	case "completed":
+		statusColor = "35"
+	case "running":
+		statusColor = "214"
+	case "failed":
+		statusColor = "196"
+	}
+	statusBadge := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("15")).
+		Background(lipgloss.Color(statusColor)).
+		Padding(0, 1).
+		Render(run.Status)
+
+	return strings.Join([]string{
+		titleStyle.Render("Latest Run"),
+		"",
+		"  " + labelStyle.Render("ID          ") + valueStyle.Render(run.ID),
+		"  " + labelStyle.Render("Directory   ") + valueStyle.Render(run.Dir),
+		"  " + labelStyle.Render("Status      ") + statusBadge,
+		"  " + labelStyle.Render("Progress    ") + valueStyle.Render(fmt.Sprintf("%d/%d", run.Completed+run.Failed, run.TotalFiles)),
+		"  " + labelStyle.Render("Succeeded   ") + lipgloss.NewStyle().Foreground(lipgloss.Color("35")).Bold(true).Render(fmt.Sprintf("%d", run.Completed)),
+		"  " + labelStyle.Render("Failed      ") + lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true).Render(fmt.Sprintf("%d", run.Failed)),
+		"  " + labelStyle.Render("Current     ") + valueStyle.Render(emptyFallback(run.CurrentFile, "-")),
+	}, "\n")
 }
 
 func renderHistory(snapshot executor.StateSnapshot) string {
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81"))
+	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+	rowStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+
 	if len(snapshot.Runs) == 0 {
-		return "暂无历史记录。"
+		return dimStyle.Render("暂无历史记录。")
 	}
-	lines := []string{"Run History"}
+	lines := []string{
+		titleStyle.Render("Run History"),
+		"",
+		dimStyle.Render("  Time                 Dir                  Status    Progress"),
+		dimStyle.Render("  " + strings.Repeat("─", 70)),
+	}
 	for _, run := range snapshot.Runs {
-		lines = append(lines, fmt.Sprintf("%s  %s  %s  %d/%d", run.StartedAt.Format("2006-01-02 15:04:05"), run.Dir, run.Status, run.Completed+run.Failed, run.TotalFiles))
+		statusColor := "243"
+		switch run.Status {
+		case "completed":
+			statusColor = "35"
+		case "failed":
+			statusColor = "196"
+		}
+		statusRendered := lipgloss.NewStyle().Foreground(lipgloss.Color(statusColor)).Render(run.Status)
+		lines = append(lines, "  "+rowStyle.Render(fmt.Sprintf("%-21s %-20s ", run.StartedAt.Format("2006-01-02 15:04:05"), truncateString(run.Dir, 20)))+statusRendered+rowStyle.Render(fmt.Sprintf("  %d/%d", run.Completed+run.Failed, run.TotalFiles)))
 	}
 	return strings.Join(lines, "\n")
+}
+
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	if maxLen <= 3 {
+		return s[:maxLen]
+	}
+	return s[:maxLen-3] + "..."
 }
 
 func emptyFallback(value, fallback string) string {
@@ -725,6 +962,34 @@ func renderProgressSummary(current, total int) string {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Render("0/0")
 	}
 	return lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Render(fmt.Sprintf("%d/%d", current, total))
+}
+
+func renderProgressBar(current, total, barWidth int) string {
+	if total <= 0 {
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Render("0/0")
+	}
+	if barWidth < 8 {
+		barWidth = 8
+	}
+
+	pct := float64(current) / float64(total)
+	if pct > 1 {
+		pct = 1
+	}
+	filled := int(pct * float64(barWidth))
+	if filled > barWidth {
+		filled = barWidth
+	}
+
+	filledStr := strings.Repeat("█", filled)
+	emptyStr := strings.Repeat("░", barWidth-filled)
+
+	bar := lipgloss.NewStyle().Foreground(lipgloss.Color("35")).Render(filledStr) +
+		lipgloss.NewStyle().Foreground(lipgloss.Color("238")).Render(emptyStr)
+
+	counter := lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Render(fmt.Sprintf(" %d/%d", current, total))
+
+	return bar + counter
 }
 
 func renderShiftStats(planned, shifted, failed int) string {
