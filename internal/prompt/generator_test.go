@@ -150,6 +150,30 @@ func TestGenerateSkipsInfrastructureOwnerSteps(t *testing.T) {
 	}
 }
 
+func TestGenerateCompileFixPromptMentionsCompilerErrorsAndDependencies(t *testing.T) {
+	cfg := config.DefaultConfig()
+	g := NewGenerator(cfg)
+
+	promptText := g.GenerateCompileFixPrompt(
+		"/tmp/case.spec.ts",
+		"TypeScript compile failed: missing modules (1)\n@utils/index",
+		2,
+	)
+
+	if !strings.Contains(promptText, "编译失败修复任务（第 2 次修正）") {
+		t.Fatalf("prompt missing retry heading: %s", promptText)
+	}
+	if !strings.Contains(promptText, "TypeScript compile failed: missing modules") {
+		t.Fatalf("prompt missing compile error details: %s", promptText)
+	}
+	if !strings.Contains(promptText, "依赖缺失时，必须迁移或替换依赖") {
+		t.Fatalf("prompt missing dependency migration instruction: %s", promptText)
+	}
+	if !strings.Contains(promptText, "不需要运行测试") {
+		t.Fatalf("prompt should explicitly skip tests: %s", promptText)
+	}
+}
+
 func TestGenerateSkipsForceInfraMethodSteps(t *testing.T) {
 	cfg := config.DefaultConfig()
 	g := NewGenerator(cfg)
@@ -194,6 +218,85 @@ func TestGenerateSkipsForceInfraMethodSteps(t *testing.T) {
 	}
 	if !strings.Contains(promptText, "listPage.commonActions.editCampaign2") {
 		t.Fatalf("prompt should keep business wrapper step: %s", promptText)
+	}
+}
+
+func TestGenerateCrossRepoPromptIncludesResolvedLocalAliasDependencies(t *testing.T) {
+	cfg := config.DefaultConfig()
+	dir := t.TempDir()
+	cfg.Source.Dir = dir
+	cfg.Target.BaseDir = filepath.Join(dir, "target-repo")
+	g := NewGenerator(cfg)
+
+	tsconfigPath := filepath.Join(dir, "tsconfig.json")
+	if err := os.WriteFile(tsconfigPath, []byte(`{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@testData/*": ["./e2e/test_data/*"],
+      "@utils/*": ["./e2e/utils/*"]
+    }
+  }
+}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(tsconfig): %v", err)
+	}
+
+	casePath := filepath.Join(dir, "e2e", "tests", "brand", "case.spec.ts")
+	if err := os.MkdirAll(filepath.Dir(casePath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(case dir): %v", err)
+	}
+	if err := os.WriteFile(casePath, []byte(`import { CaseTags } from '@testData/index';
+import { commonAfter } from '@utils/index';
+
+test("x", async () => {
+  console.log(CaseTags.P1, commonAfter);
+})`), 0o644); err != nil {
+		t.Fatalf("WriteFile(case): %v", err)
+	}
+
+	testDataIndex := filepath.Join(dir, "e2e", "test_data", "index.ts")
+	if err := os.MkdirAll(filepath.Dir(testDataIndex), 0o755); err != nil {
+		t.Fatalf("MkdirAll(testData dir): %v", err)
+	}
+	if err := os.WriteFile(testDataIndex, []byte(`export const CaseTags = { P1: "P1" };`), 0o644); err != nil {
+		t.Fatalf("WriteFile(testData): %v", err)
+	}
+
+	utilsIndex := filepath.Join(dir, "e2e", "utils", "index.ts")
+	if err := os.MkdirAll(filepath.Dir(utilsIndex), 0o755); err != nil {
+		t.Fatalf("MkdirAll(utils dir): %v", err)
+	}
+	if err := os.WriteFile(utilsIndex, []byte(`export const commonAfter = async () => {};`), 0o644); err != nil {
+		t.Fatalf("WriteFile(utils): %v", err)
+	}
+
+	analysis := &types.FullAnalysis{
+		FilePath:   casePath,
+		TargetPath: filepath.Join(cfg.Target.BaseDir, "e2e", "tests", "brand", "case.spec.ts"),
+		Language:   "typescript",
+		AST: &types.ASTInfo{
+			Imports: []types.ImportInfo{
+				{Path: "@testData/index", Name: "{ CaseTags }"},
+				{Path: "@utils/index", Name: "{ commonAfter }"},
+			},
+		},
+	}
+
+	promptText, err := g.Generate(analysis)
+	if err != nil {
+		t.Fatalf("Generate returned error: %v", err)
+	}
+	if !strings.Contains(promptText, "源仓库本地依赖 import") {
+		t.Fatalf("prompt missing cross-repo local import dependency section: %s", promptText)
+	}
+	if !strings.Contains(promptText, "@testData/index") || !strings.Contains(promptText, testDataIndex) {
+		t.Fatalf("prompt missing resolved @testData dependency details: %s", promptText)
+	}
+	if !strings.Contains(promptText, "@utils/index") || !strings.Contains(promptText, utilsIndex) {
+		t.Fatalf("prompt missing resolved @utils dependency details: %s", promptText)
+	}
+	if !strings.Contains(promptText, "不能直接原样保留") {
+		t.Fatalf("prompt missing cross-repo alias rewrite constraint: %s", promptText)
 	}
 }
 

@@ -8,13 +8,22 @@
 import { MidsceneCaseFunctionParams } from '@byted-midscene/pagepass-plugin';
 import type { CaseFunctionParams } from '@pagepass/test';
 
-describe('模块名', () => {
+describe('vv_cbo_standard6s_cta', () => {
+  before(async ({ page }) => {
+    await 原 case 中的 before 注入函数(page);
+  });
+  before(commonBeforeForBrandAuction);
+
   it('case 名称', async (params: CaseFunctionParams<'test'>) => {
+    const { page } = params;
     const { midscene } = params as MidsceneCaseFunctionParams;
     const { agent } = midscene!;
-    const campaignLogic = new SalesCreateLogic(page);
-    await campaignLogic.goToCreatePage({ advid: advid });//advid信息根据原有代码动态获取
-    // 所有操作通过 agent 完成
+
+    // 起手必须先复用原 case 的 before 链路，完成环境、cookie、权限、advId 注入
+    // 不要把 goToCreatePage() 当成固定模板；页面进入方式沿用原 case 即可
+    await page.goto('原 case 实际访问的页面或入口链接');
+
+    // 所有交互统一通过 agent 完成
     await agent.aiTap("点击'Sales'");
     await agent.aiInput("55", "'Daily'右侧的输入框");
     await agent.aiAssert("展示'Goal'元素");
@@ -22,15 +31,43 @@ describe('模块名', () => {
 });
 ```
 
-**关键三行（导入 → 解构 → 取 agent）**：
+**关键起手式（导入 → before 注入 → 解构 → 取 agent）**：
 
 ```typescript
 import { MidsceneCaseFunctionParams } from '@byted-midscene/pagepass-plugin';
+before(async ({ page }) => {
+  await 原 case 中的 before 注入函数(page);
+});
+before(commonBeforeForBrandAuction);
 const { midscene } = params as MidsceneCaseFunctionParams;
 const { agent } = midscene!;
 ```
 
 > `agent` 是所有 AI 操作的唯一入口，替代 NEP 中的 `page.element()`、`ai?.action()`、`ai?.getElement()` 等全部方式。
+
+> `before` 链路不要删。像 `commonBeforeForBrandAuction` 这类封装，本质上会继续走 `commonBefore(..., EnumAdvIDInfo.ADV_Brand_Auction)`，里面会执行 `setEnv(page)`、`setCookies(page, advInfo?.userId)`、`mockPermission(page, advInfo)`、`mockUnSelectReco(page, advInfo?.advId)` 和窗口尺寸设置；这部分就是当前页面跳转前所依赖的 cookie / 用户 / 广告主上下文。
+
+> case 级 `before` 也要保留，但不要把函数名写死。agent 必须回到原始 case 代码里查当前 case 实际用了哪个 `before(async ({ page }) => ...)` 注入函数，并原样继承到 Midscene case 中。它通常负责在进入页面前补齐接口拦截，例如：
+
+```typescript
+export const XxxActionCreation = (page: Page) => {
+  return page.intercept(
+    '某个原 case 依赖的接口',
+    MockResponse,
+  );
+};
+```
+
+> 也就是说，agent 的固定动作应该是：先打开原始 case 文件，找到 `describe` 里的全部 `before(...)` / `beforeEach(...)`，识别出页面跳转前依赖的注入函数、公共 `commonBeforeXxx` 封装、以及对应的 `EnumAdvIDInfo`，再把这套上下文迁移到 Midscene case；不要臆造一个通用的 `BrandActionCreation`。
+
+> 对应账号信息如果原 case 使用 `EnumAdvIDInfo.ADV_Brand_Auction`，则沿用这套 advertiser 上下文：
+
+```typescript
+ADV_Brand_Auction: {
+  advId: '7594306930307383297',
+  userId: '7594306459032159243',
+},
+```
 
 ---
 

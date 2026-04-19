@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -24,6 +25,9 @@ type Engine struct {
 	tsBridge          *TSBridge
 	sourceRepoRoot    string // detected source repository root (for cross-repo mode)
 }
+
+// AnalyzeProgressFunc reports completed file count during directory analysis.
+type AnalyzeProgressFunc func(current, total int, filePath string)
 
 func NewEngine(cfg *config.Config) *Engine {
 	customMappings := make(map[string]*types.MigrationRule)
@@ -146,6 +150,12 @@ func (e *Engine) analyzeTypeScriptFile(filePath string, result *types.FullAnalys
 
 // AnalyzeDir analyzes all matching files in a directory
 func (e *Engine) AnalyzeDir(dir string) ([]*types.FullAnalysis, error) {
+	return e.AnalyzeDirWithProgress(dir, nil)
+}
+
+// AnalyzeDirWithProgress analyzes all matching files in a directory and reports
+// per-file completion progress after each file analysis attempt.
+func (e *Engine) AnalyzeDirWithProgress(dir string, progress AnalyzeProgressFunc) ([]*types.FullAnalysis, error) {
 	// In cross-repo mode, auto-detect source repo root if not set.
 	if e.cfg.IsCrossRepo() && e.sourceRepoRoot == "" {
 		e.sourceRepoRoot = DetectSourceRepoRoot(dir)
@@ -159,36 +169,71 @@ func (e *Engine) AnalyzeDir(dir string) ([]*types.FullAnalysis, error) {
 		targetBaseAbs, _ = filepath.Abs(e.cfg.Target.BaseDir)
 	}
 
+	files, err := e.collectAnalyzableFiles(dir, targetBaseAbs)
+	if err != nil {
+		return nil, err
+	}
+
+	total := len(files)
+	for idx, path := range files {
+		analysis, analyzeErr := e.AnalyzeFile(path)
+		if analyzeErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to analyze %s: %v\n", path, analyzeErr)
+		} else {
+			results = append(results, analysis)
+		}
+		if progress != nil {
+			progress(idx+1, total, path)
+		}
+	}
+
+	return results, nil
+}
+
+func (e *Engine) collectAnalyzableFiles(dir string, targetBaseAbs string) ([]string, error) {
+	var files []string
+
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if info.IsDir() {
-			// Skip output directory (same-repo mode)
-			if info.Name() == e.cfg.Target.OutputDir {
+			if e.shouldSkipDir(path, info.Name(), targetBaseAbs) {
 				return filepath.SkipDir
-			}
-			// Skip target base directory if it's inside the source tree (cross-repo guard)
-			if targetBaseAbs != "" {
-				absPath, _ := filepath.Abs(path)
-				if absPath == targetBaseAbs {
-					return filepath.SkipDir
-				}
 			}
 			return nil
 		}
 		if e.matchesPattern(info.Name()) {
-			analysis, err := e.AnalyzeFile(path)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to analyze %s: %v\n", path, err)
-				return nil
-			}
-			results = append(results, analysis)
+			files = append(files, path)
 		}
 		return nil
 	})
 
-	return results, err
+	if err != nil {
+		return nil, err
+	}
+
+	sort.Strings(files)
+	return files, nil
+}
+
+func (e *Engine) shouldSkipDir(path, name, targetBaseAbs string) bool {
+	if name == e.cfg.Target.OutputDir {
+		return true
+	}
+	for _, excluded := range e.cfg.Source.Exclude {
+		if name == excluded {
+			return true
+		}
+	}
+	if targetBaseAbs == "" {
+		return false
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	return absPath == targetBaseAbs
 }
 
 func (e *Engine) matchesPattern(name string) bool {

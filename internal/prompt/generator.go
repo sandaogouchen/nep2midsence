@@ -29,6 +29,7 @@ type PromptData struct {
 	TargetFile        string
 	TaskKind          string
 	RelatedFiles      []string
+	LocalImportDeps   []LocalImportDepEntry
 	ReferenceDocs     []string
 	APIMappings       []MappingEntry
 	OperationSteps    []OperationStep
@@ -78,6 +79,12 @@ type DefaultPromptEntry struct {
 	ClassName   string
 	PromptValue string
 	FilePath    string
+}
+
+type LocalImportDepEntry struct {
+	ImportPath string
+	ImportSpec string
+	SourceFile string
 }
 
 type DataFlowEntry struct {
@@ -308,6 +315,10 @@ func (g *Generator) buildPromptData(analysis *types.FullAnalysis) *PromptData {
 	if analysis.Dependencies != nil {
 		data.RelatedFiles = append(data.RelatedFiles, analysis.Dependencies...)
 	}
+	data.LocalImportDeps = g.buildLocalImportDeps(analysis)
+	for _, dep := range data.LocalImportDeps {
+		data.RelatedFiles = append(data.RelatedFiles, dep.SourceFile)
+	}
 	data.RelatedFiles = uniqueNonEmpty(data.RelatedFiles)
 
 	// Build constraints
@@ -353,6 +364,7 @@ func (g *Generator) buildPromptData(analysis *types.FullAnalysis) *PromptData {
 			"从源仓库 Read 源文件，将迁移结果写入目标仓库对应路径；目标目录不存在时自动创建",
 			"输出文件中不得残留任何 NEP 相关 import 或调用（ai.action、ai?.action、from 'nep'、AiAgent 等）",
 			"仅修改 NEP/ai/AiAgent 相关代码，Pagepass 业务逻辑、selector 操作、工具函数等保持不变",
+			"跨仓库时，源仓库本地 alias / 相对依赖（尤其 @testData/*、@utils/*、@pages/* 等）不能直接原样保留到目标仓库；若目标仓库不存在同名模块，必须 Read 源依赖后把当前文件实际用到的常量、enum、mock 数据或小型 helper 做最小化内联，或改写为目标仓库内可解析的本地依赖",
 		)
 	}
 
@@ -375,6 +387,45 @@ func uniqueNonEmpty(items []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func (g *Generator) buildLocalImportDeps(analysis *types.FullAnalysis) []LocalImportDepEntry {
+	if analysis == nil || analysis.AST == nil {
+		return nil
+	}
+
+	var tscp *config.TsConfigPaths
+	if tsconfigPath := findNearestPromptTSConfig(analysis.FilePath); tsconfigPath != "" {
+		if loaded, err := config.LoadTsConfig(tsconfigPath); err == nil {
+			tscp = loaded
+		}
+	}
+
+	seen := make(map[string]struct{})
+	var deps []LocalImportDepEntry
+	for _, imp := range analysis.AST.Imports {
+		resolved := resolvePromptImportFile(analysis.FilePath, imp.Path, tscp)
+		if resolved == "" {
+			continue
+		}
+		key := strings.TrimSpace(imp.Path) + "|" + filepath.Clean(resolved) + "|" + strings.TrimSpace(imp.Name)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		deps = append(deps, LocalImportDepEntry{
+			ImportPath: strings.TrimSpace(imp.Path),
+			ImportSpec: strings.TrimSpace(imp.Name),
+			SourceFile: filepath.Clean(resolved),
+		})
+	}
+	sort.Slice(deps, func(i, j int) bool {
+		if deps[i].ImportPath == deps[j].ImportPath {
+			return deps[i].SourceFile < deps[j].SourceFile
+		}
+		return deps[i].ImportPath < deps[j].ImportPath
+	})
+	return deps
 }
 
 func buildWrapperMidsceneCall(step types.CallStep) string {
@@ -424,6 +475,41 @@ func detectCodeFenceLanguage(filePath, language string) string {
 	default:
 		return "go"
 	}
+}
+
+func findNearestPromptTSConfig(filePath string) string {
+	cur := filepath.Dir(filePath)
+	for cur != "" {
+		candidate := filepath.Join(cur, "tsconfig.json")
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+	return ""
+}
+
+func resolvePromptImportFile(baseFile, importPath string, tscp *config.TsConfigPaths) string {
+	importPath = strings.TrimSpace(importPath)
+	if importPath == "" {
+		return ""
+	}
+	if strings.HasPrefix(importPath, ".") {
+		return resolveLocalImportFile(baseFile, importPath)
+	}
+	if tscp != nil && tscp.CanResolve(importPath) {
+		for _, candidate := range tscp.Resolve(importPath) {
+			info, err := os.Stat(candidate)
+			if err == nil && !info.IsDir() {
+				return candidate
+			}
+		}
+	}
+	return ""
 }
 
 func (g *Generator) buildRelatedCode(analysis *types.FullAnalysis) string {
@@ -757,4 +843,44 @@ func (g *Generator) GenerateNepFixPrompt(targetFile string, nepMarkers string, a
 2. 确保修改后文件语法正确，import 完整
 3. 不要新增任何不必要的代码
 `, attempt, targetFile, nepMarkers, targetFile, targetFile)
+}
+
+// GenerateCompileFixPrompt creates a targeted prompt for repairing compiler
+// errors after the initial migration and NEP cleanup passes have finished.
+func (g *Generator) GenerateCompileFixPrompt(targetFile string, compileError string, attempt int) string {
+	return fmt.Sprintf(`## 编译失败修复任务（第 %d 次修正）
+
+**严格按照以下指令执行，不要做额外的事情。**
+
+---
+
+### 问题描述
+
+文件 `+"`%s`"+` 当前编译失败，编译器输出如下：
+
+`+"```\n%s\n```"+`
+
+你必须以这些编译错误为准修复目标文件，确保文件最终可被当前仓库编译器通过。
+
+---
+
+### 操作步骤
+
+1. **Read** 目标文件 `+"`%s`"+`
+2. **根据编译报错修复代码**，优先处理语法、类型、import、导出、符号缺失、调用签名不匹配等问题
+3. **如果是依赖缺失**：
+   - 依赖缺失时，必须迁移或替换依赖；必要时可以改写缺失依赖
+   - 这类依赖不一定是 NEP 依赖，也可能是普通本地依赖、alias 依赖或跨仓库依赖
+   - 若目标仓库没有同名模块，必须把当前文件实际用到的最小实现迁移进来，或改写为目标仓库内可解析的本地依赖
+4. **Write** 修正后的完整文件到原路径 `+"`%s`"+`
+
+---
+
+### 约束
+
+1. 只修复与编译失败直接相关的问题，不要做无关重构
+2. 不需要运行测试，只需要确保编译通过
+3. 尽量保持业务逻辑不变
+4. 不要保留会导致当前仓库无法解析的 import
+`, attempt, targetFile, compileError, targetFile, targetFile)
 }

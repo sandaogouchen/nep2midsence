@@ -1,14 +1,17 @@
 package tui
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sandaogouchen/nep2midsence/internal/analyzer"
 	"github.com/sandaogouchen/nep2midsence/internal/config"
+	"github.com/sandaogouchen/nep2midsence/internal/executor"
 	"github.com/sandaogouchen/nep2midsence/internal/types"
 )
 
@@ -339,6 +342,63 @@ export class CampaignBudgetRadio {
 	}
 }
 
+func TestCollectCompileFixIndicesOnlyReturnsSuccessfulCompileFailures(t *testing.T) {
+	results := []*types.MigrationResult{
+		{CaseFile: "case-a.ts", Success: true},
+		{CaseFile: "case-b.ts", Success: true},
+		{CaseFile: "case-c.ts", Success: false},
+		{CaseFile: "case-d.ts", Success: true},
+	}
+	verifyResults := []*types.VerifyResult{
+		{CaseFile: "case-a.ts", CompileOK: false, CompileError: "missing module"},
+		{CaseFile: "case-b.ts", CompileOK: true},
+		{CaseFile: "case-c.ts", CompileOK: false, CompileError: "syntax error"},
+		{CaseFile: "case-d.ts", CompileOK: false, CompileError: ""},
+	}
+
+	got := collectCompileFixIndices(results, verifyResults)
+	if len(got) != 1 {
+		t.Fatalf("collectCompileFixIndices returned %v, want [0]", got)
+	}
+	if got[0] != 0 {
+		t.Fatalf("collectCompileFixIndices returned %v, want first failing successful result only", got)
+	}
+}
+
+func TestBuildTypeScriptCompileCommandUsesTargetTsconfigAndLocalTSC(t *testing.T) {
+	dir := t.TempDir()
+	projectRoot := filepath.Join(dir, "target-repo")
+	tsconfigPath := filepath.Join(projectRoot, "tsconfig.json")
+	localTSC := filepath.Join(projectRoot, "node_modules", ".bin", "tsc")
+	targetFile := filepath.Join(projectRoot, "e2e", "tests", "case.spec.ts")
+
+	if err := os.MkdirAll(filepath.Dir(tsconfigPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(tsconfig): %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(localTSC), 0o755); err != nil {
+		t.Fatalf("MkdirAll(localTSC): %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(targetFile), 0o755); err != nil {
+		t.Fatalf("MkdirAll(targetFile): %v", err)
+	}
+	if err := os.WriteFile(tsconfigPath, []byte(`{"compilerOptions":{}}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(tsconfig): %v", err)
+	}
+	if err := os.WriteFile(localTSC, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(localTSC): %v", err)
+	}
+	if err := os.WriteFile(targetFile, []byte(`export const ok = true;`), 0o644); err != nil {
+		t.Fatalf("WriteFile(targetFile): %v", err)
+	}
+
+	results := []*types.MigrationResult{{TargetFile: targetFile, Success: true}}
+	got := buildTypeScriptCompileCommand(projectRoot, results)
+	want := localTSC + " --noEmit -p " + tsconfigPath
+	if got != want {
+		t.Fatalf("buildTypeScriptCompileCommand() = %q, want %q", got, want)
+	}
+}
+
 func TestBuildMigrationPlanAggregatesHelperMethodsAcrossCases(t *testing.T) {
 	dir := t.TempDir()
 	cfg := config.DefaultConfig()
@@ -508,4 +568,261 @@ export class AdGroupPage {
 	if got.Reason == "" {
 		t.Fatal("expected unresolved helper reason to be populated")
 	}
+}
+
+func TestBuildMigrationPlanResolvesInheritedHelperMethods(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Source.Dir = dir
+	engine := analyzer.NewEngine(cfg)
+
+	e2eDir := filepath.Join(dir, "e2e")
+	caseDir := filepath.Join(e2eDir, "tests", "campaign")
+	poDir := filepath.Join(e2eDir, "pages", "new_pages", "campaignPage")
+	componentDir := filepath.Join(poDir, "components")
+	utilsDir := filepath.Join(e2eDir, "utils", "coreComponents")
+	if err := os.MkdirAll(caseDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(caseDir): %v", err)
+	}
+	if err := os.MkdirAll(componentDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(componentDir): %v", err)
+	}
+	if err := os.MkdirAll(utilsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(utilsDir): %v", err)
+	}
+
+	tsconfigPath := filepath.Join(dir, "tsconfig.json")
+	tsconfigSource := `{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@pages/*": ["e2e/pages/*"],
+      "@utils/*": ["e2e/utils/*"]
+    }
+  }
+}`
+	if err := os.WriteFile(tsconfigPath, []byte(tsconfigSource), 0o644); err != nil {
+		t.Fatalf("WriteFile(tsconfig): %v", err)
+	}
+
+	radioPath := filepath.Join(utilsDir, "Radio.ts")
+	radioSource := `export class Radio {
+  async click() {}
+}`
+	if err := os.WriteFile(radioPath, []byte(radioSource), 0o644); err != nil {
+		t.Fatalf("WriteFile(radio): %v", err)
+	}
+
+	componentPath := filepath.Join(componentDir, "AdgroupBudgetRadio.ts")
+	componentSource := `import { Radio } from '@utils/coreComponents/Radio';
+
+export class AdgroupBudgetRadio extends Radio {}
+`
+	if err := os.WriteFile(componentPath, []byte(componentSource), 0o644); err != nil {
+		t.Fatalf("WriteFile(component): %v", err)
+	}
+
+	poPath := filepath.Join(poDir, "CampaignPage.ts")
+	poSource := `import { AdgroupBudgetRadio } from '@pages/new_pages/campaignPage/components/AdgroupBudgetRadio';
+
+export class CampaignPage {
+  adgroupBudgetRadio: AdgroupBudgetRadio;
+
+  constructor(page: unknown) {
+    this.adgroupBudgetRadio = new AdgroupBudgetRadio(page);
+  }
+}
+`
+	if err := os.WriteFile(poPath, []byte(poSource), 0o644); err != nil {
+		t.Fatalf("WriteFile(po): %v", err)
+	}
+
+	casePath := filepath.Join(caseDir, "case.spec.ts")
+	caseSource := `test("campaign", async ({ campaignPage }) => {
+  await campaignPage.adgroupBudgetRadio.click();
+})`
+	if err := os.WriteFile(casePath, []byte(caseSource), 0o644); err != nil {
+		t.Fatalf("WriteFile(case): %v", err)
+	}
+
+	analyses, err := engine.AnalyzeDir(dir)
+	if err != nil {
+		t.Fatalf("AnalyzeDir: %v", err)
+	}
+
+	plan, err := buildMigrationPlan(cfg, engine, analyses, nil)
+	if err != nil {
+		t.Fatalf("buildMigrationPlan: %v", err)
+	}
+
+	if len(plan.ToExecuteHelpers) != 1 {
+		t.Fatalf("helper task count = %d, want 1", len(plan.ToExecuteHelpers))
+	}
+	helper := plan.ToExecuteHelpers[0]
+	if helper.FilePath != componentPath {
+		t.Fatalf("helper source = %q, want %q", helper.FilePath, componentPath)
+	}
+	if helper.HelperPlan == nil {
+		t.Fatal("expected helper plan metadata on helper task")
+	}
+	if strings.Join(helper.HelperPlan.Methods, ",") != "click" {
+		t.Fatalf("helper methods = %v, want [click]", helper.HelperPlan.Methods)
+	}
+	if len(plan.ToExecuteCases) != 1 {
+		t.Fatalf("case task count = %d, want 1", len(plan.ToExecuteCases))
+	}
+	if len(plan.ToExecuteCases[0].UnresolvedHelpers) != 0 {
+		t.Fatalf("unexpected unresolved helpers: %+v", plan.ToExecuteCases[0].UnresolvedHelpers)
+	}
+}
+
+func TestRunStartStreamsAnalyzeProgressBeforeGenerate(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Source.Dir = dir
+	cfg.Execution.MaxJobs = 1
+	cfg.Execution.RetryLimit = 0
+	runtime := NewRuntime(cfg)
+	runtime.preflightCheck = func(string) error { return nil }
+	runtime.newPromptExecutor = func(tool, workDir string) executor.PromptExecutor {
+		return stubPromptExecutor{}
+	}
+
+	sourcePath := filepath.Join(dir, "case.spec.ts")
+	if err := os.WriteFile(sourcePath, []byte(`test("case", async () => {
+  await page.click("#submit")
+})`), 0o644); err != nil {
+		t.Fatalf("write source file: %v", err)
+	}
+
+	targetPath := filepath.Join(dir, cfg.Target.OutputDir, "case.spec"+cfg.Target.FileSuffix+".ts")
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		t.Fatalf("mkdir target dir: %v", err)
+	}
+	if err := os.WriteFile(targetPath, []byte(`export async function migrated(agent) {
+  await agent.aiTap("提交按钮")
+}`), 0o644); err != nil {
+		t.Fatalf("write target file: %v", err)
+	}
+
+	var events []WorkflowEvent
+	_, err := runtime.RunStart(context.Background(), dir, "", func(event WorkflowEvent) {
+		events = append(events, event)
+	})
+	if err != nil {
+		t.Fatalf("RunStart: %v", err)
+	}
+
+	findIndex := func(match func(WorkflowEvent) bool) int {
+		t.Helper()
+		for i, event := range events {
+			if match(event) {
+				return i
+			}
+		}
+		return -1
+	}
+
+	analyzeStart := findIndex(func(event WorkflowEvent) bool {
+		return event.Stage == "analyze" && event.Message == "分析目录结构"
+	})
+	if analyzeStart < 0 {
+		t.Fatal("missing initial analyze event")
+	}
+
+	progressIdx := findIndex(func(event WorkflowEvent) bool {
+		return event.Stage == "analyze" && event.Current == 1 && event.Total == 1 && event.CurrentFile == sourcePath
+	})
+	if progressIdx < 0 {
+		t.Fatal("missing analyze progress event")
+	}
+
+	generateIdx := findIndex(func(event WorkflowEvent) bool {
+		return event.Stage == "generate" && strings.Contains(event.Message, "生成迁移计划")
+	})
+	if generateIdx < 0 {
+		t.Fatal("missing generate event")
+	}
+
+	if !(analyzeStart < progressIdx && progressIdx < generateIdx) {
+		t.Fatalf("event order invalid: analyzeStart=%d progress=%d generate=%d", analyzeStart, progressIdx, generateIdx)
+	}
+}
+
+func TestRunStartAnalyzeProgressExcludesCrossRepoTargetDirectory(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Source.Dir = dir
+	cfg.Execution.MaxJobs = 1
+	cfg.Execution.RetryLimit = 0
+	runtime := NewRuntime(cfg)
+	runtime.preflightCheck = func(string) error { return nil }
+	runtime.newPromptExecutor = func(tool, workDir string) executor.PromptExecutor {
+		return stubPromptExecutor{}
+	}
+
+	sourceDir := filepath.Join(dir, "e2e", "tests")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatalf("mkdir source dir: %v", err)
+	}
+	sourcePath := filepath.Join(sourceDir, "case.spec.ts")
+	if err := os.WriteFile(sourcePath, []byte(`test("case", async () => {
+  await page.click("#submit")
+})`), 0o644); err != nil {
+		t.Fatalf("write source file: %v", err)
+	}
+
+	targetBaseDir := filepath.Join(dir, "target-repo")
+	targetNoisePath := filepath.Join(targetBaseDir, "noise.spec.ts")
+	if err := os.MkdirAll(filepath.Dir(targetNoisePath), 0o755); err != nil {
+		t.Fatalf("mkdir target repo: %v", err)
+	}
+	if err := os.WriteFile(targetNoisePath, []byte(`test("noise", async () => {})`), 0o644); err != nil {
+		t.Fatalf("write target noise file: %v", err)
+	}
+
+	targetPath := filepath.Join(targetBaseDir, "e2e", "tests", "case.spec.ts")
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		t.Fatalf("mkdir cross-repo target dir: %v", err)
+	}
+	if err := os.WriteFile(targetPath, []byte(`export async function migrated(agent) {
+  await agent.aiTap("提交按钮")
+}`), 0o644); err != nil {
+		t.Fatalf("write cross-repo target file: %v", err)
+	}
+
+	var events []WorkflowEvent
+	_, err := runtime.RunStart(context.Background(), dir, targetBaseDir, func(event WorkflowEvent) {
+		events = append(events, event)
+	})
+	if err != nil {
+		t.Fatalf("RunStart: %v", err)
+	}
+
+	progressEvents := make([]WorkflowEvent, 0)
+	for _, event := range events {
+		if event.Stage == "analyze" && event.Total > 0 {
+			progressEvents = append(progressEvents, event)
+		}
+	}
+	if len(progressEvents) != 1 {
+		t.Fatalf("analyze progress event count = %d, want 1", len(progressEvents))
+	}
+	if progressEvents[0].Total != 1 {
+		t.Fatalf("analyze progress total = %d, want 1", progressEvents[0].Total)
+	}
+	if progressEvents[0].CurrentFile != sourcePath {
+		t.Fatalf("analyze progress currentFile = %q, want %q", progressEvents[0].CurrentFile, sourcePath)
+	}
+}
+
+type stubPromptExecutor struct{}
+
+func (stubPromptExecutor) Execute(ctx context.Context, prompt string) (*types.CocoOutput, error) {
+	return &types.CocoOutput{
+		Success:  true,
+		ExitCode: 0,
+		Duration: time.Millisecond,
+		Output:   prompt,
+	}, nil
 }

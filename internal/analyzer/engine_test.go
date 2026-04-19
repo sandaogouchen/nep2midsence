@@ -3,6 +3,7 @@ package analyzer
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -112,6 +113,93 @@ func TestAnalyzeFileCapturesMultiLevelReceiverChain(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("did not find wrapper call in extracted steps")
+	}
+}
+
+func TestAnalyzeDirWithProgressSkipsOutputDirectoryAndReportsStableTotals(t *testing.T) {
+	cfg := config.DefaultConfig()
+	engine := NewEngine(cfg)
+
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "case.spec.ts")
+	if err := os.WriteFile(sourcePath, []byte(`test("case", async () => {
+  await page.click("#submit")
+})`), 0o644); err != nil {
+		t.Fatalf("write source file: %v", err)
+	}
+
+	skippedDir := filepath.Join(dir, cfg.Target.OutputDir)
+	if err := os.MkdirAll(skippedDir, 0o755); err != nil {
+		t.Fatalf("mkdir skipped dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skippedDir, "case_converted.ts"), []byte(`test("skip", async () => {})`), 0o644); err != nil {
+		t.Fatalf("write skipped file: %v", err)
+	}
+
+	type progressEvent struct {
+		current int
+		total   int
+		file    string
+	}
+	var events []progressEvent
+
+	results, err := engine.AnalyzeDirWithProgress(dir, func(current, total int, filePath string) {
+		events = append(events, progressEvent{current: current, total: total, file: filePath})
+	})
+	if err != nil {
+		t.Fatalf("AnalyzeDirWithProgress: %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("result count = %d, want 1", len(results))
+	}
+	wantEvents := []progressEvent{{current: 1, total: 1, file: sourcePath}}
+	if !reflect.DeepEqual(events, wantEvents) {
+		t.Fatalf("progress events = %#v, want %#v", events, wantEvents)
+	}
+}
+
+func TestAnalyzeDirWithProgressContinuesAfterFileFailure(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Source.Extensions = []string{".go"}
+	engine := NewEngine(cfg)
+
+	dir := t.TempDir()
+	badPath := filepath.Join(dir, "broken.go")
+	if err := os.WriteFile(badPath, []byte("package broken\nfunc TestBroken( {\n"), 0o644); err != nil {
+		t.Fatalf("write bad file: %v", err)
+	}
+	goodPath := filepath.Join(dir, "valid.go")
+	if err := os.WriteFile(goodPath, []byte("package broken\nfunc Helper() {}\n"), 0o644); err != nil {
+		t.Fatalf("write good file: %v", err)
+	}
+
+	type progressEvent struct {
+		current int
+		total   int
+		file    string
+	}
+	var events []progressEvent
+
+	results, err := engine.AnalyzeDirWithProgress(dir, func(current, total int, filePath string) {
+		events = append(events, progressEvent{current: current, total: total, file: filePath})
+	})
+	if err != nil {
+		t.Fatalf("AnalyzeDirWithProgress: %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("result count = %d, want 1 analyzed file", len(results))
+	}
+	wantEvents := []progressEvent{
+		{current: 1, total: 2, file: badPath},
+		{current: 2, total: 2, file: goodPath},
+	}
+	if !reflect.DeepEqual(events, wantEvents) {
+		t.Fatalf("progress events = %#v, want %#v", events, wantEvents)
+	}
+	if results[0].FilePath != goodPath {
+		t.Fatalf("analyzed file = %q, want %q", results[0].FilePath, goodPath)
 	}
 }
 

@@ -144,6 +144,18 @@ const migrationTemplate = `## 迁移任务
 {{end}}
 {{end}}
 
+{{if .LocalImportDeps}}
+#### 6.3 源仓库本地依赖 import（跨仓库时不得直接原样保留）
+
+| import path | 当前文件实际引用 | 源文件 |
+|---|---|---|
+{{range .LocalImportDeps -}}
+| ` + "`" + `{{.ImportPath}}` + "`" + ` | ` + "`" + `{{.ImportSpec}}` + "`" + ` | ` + "`" + `{{.SourceFile}}` + "`" + ` |
+{{end}}
+
+请优先 Read 上述源文件；若目标仓库没有同名模块，不要继续保留这些 import，必须改为目标仓库内可解析的实现（最小化内联或改写为本地依赖）。
+{{end}}
+
 {{if .ExampleBefore}}
 ---
 

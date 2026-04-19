@@ -56,11 +56,26 @@ type Runtime interface {
 
 // AppRuntime is the concrete runtime wired to the existing analyzer/executor/verify pipeline.
 type AppRuntime struct {
-	cfg *config.Config
+	cfg               *config.Config
+	preflightCheck    func(string) error
+	newPromptExecutor func(tool, workDir string) executor.PromptExecutor
 }
 
 func NewRuntime(cfg *config.Config) *AppRuntime {
-	return &AppRuntime{cfg: cfg}
+	return &AppRuntime{
+		cfg:            cfg,
+		preflightCheck: executor.PreflightCheckForTool,
+		newPromptExecutor: func(tool, workDir string) executor.PromptExecutor {
+			switch tool {
+			case executor.ToolCC:
+				return executor.NewCCExecutor(workDir, 0)
+			case executor.ToolCodex:
+				return executor.NewCodexExecutor(workDir, 0)
+			default:
+				return executor.NewCocoExecutor(workDir, 0)
+			}
+		},
+	}
 }
 
 func (r *AppRuntime) ListDirectories(root string) ([]string, error) {
@@ -120,7 +135,14 @@ func (r *AppRuntime) ListImmediateDirectories(path string) ([]string, error) {
 func (r *AppRuntime) RunAnalyze(ctx context.Context, dir string, notify func(WorkflowEvent)) (*WorkflowResult, error) {
 	notify(WorkflowEvent{Stage: "analyze", Message: "正在分析目录", CurrentFile: dir})
 	engine := analyzer.NewEngine(r.cfg)
-	analyses, err := engine.AnalyzeDir(dir)
+	analyses, err := engine.AnalyzeDirWithProgress(dir, func(current, total int, filePath string) {
+		notify(WorkflowEvent{
+			Stage:       "analyze",
+			Current:     current,
+			Total:       total,
+			CurrentFile: filePath,
+		})
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +161,7 @@ func (r *AppRuntime) RunStart(ctx context.Context, dir string, targetBaseDir str
 		tool = executor.ToolCoco
 	}
 	notify(WorkflowEvent{Stage: "preflight", Message: fmt.Sprintf("检查 %s", tool)})
-	if err := executor.PreflightCheckForTool(tool); err != nil {
+	if err := r.preflightCheck(tool); err != nil {
 		return nil, err
 	}
 
@@ -153,7 +175,14 @@ func (r *AppRuntime) RunStart(ctx context.Context, dir string, targetBaseDir str
 	}
 
 	notify(WorkflowEvent{Stage: "analyze", Message: "分析目录结构"})
-	analyses, err := engine.AnalyzeDir(dir)
+	analyses, err := engine.AnalyzeDirWithProgress(dir, func(current, total int, filePath string) {
+		notify(WorkflowEvent{
+			Stage:       "analyze",
+			Current:     current,
+			Total:       total,
+			CurrentFile: filePath,
+		})
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -189,15 +218,7 @@ func (r *AppRuntime) RunStart(ctx context.Context, dir string, targetBaseDir str
 		}
 	}
 
-	var promptExec executor.PromptExecutor
-	switch tool {
-	case executor.ToolCC:
-		promptExec = executor.NewCCExecutor(execWorkDir, 0)
-	case executor.ToolCodex:
-		promptExec = executor.NewCodexExecutor(execWorkDir, 0)
-	default:
-		promptExec = executor.NewCocoExecutor(execWorkDir, 0)
-	}
+	promptExec := r.newPromptExecutor(tool, execWorkDir)
 
 	scheduler := executor.NewScheduler(promptExec, gen, r.cfg.Execution.MaxJobs, r.cfg.Execution.RetryLimit)
 
@@ -284,7 +305,8 @@ func (r *AppRuntime) RunStart(ctx context.Context, dir string, targetBaseDir str
 	if strings.TrimSpace(targetBaseDir) != "" {
 		verifyDir = targetBaseDir
 	}
-	verifier := verify.NewVerifier(verifyDir, "", "")
+	buildCmd := buildTypeScriptCompileCommand(verifyDir, results)
+	verifier := verify.NewVerifier(verifyDir, buildCmd, "")
 	verifyResults := verifier.VerifyAll(results)
 
 	// NEP residual fix loop: re-execute AI fix for files that still contain NEP markers.
@@ -293,12 +315,7 @@ func (r *AppRuntime) RunStart(ctx context.Context, dir string, targetBaseDir str
 		maxNepFixRounds = 2
 	}
 	for round := 1; round <= maxNepFixRounds; round++ {
-		var nepFailedIdx []int
-		for i, vr := range verifyResults {
-			if !vr.NepCleanOK && vr.NepCleanError != "" && results[i].Success {
-				nepFailedIdx = append(nepFailedIdx, i)
-			}
-		}
+		nepFailedIdx := collectNepFixIndices(results, verifyResults)
 		if len(nepFailedIdx) == 0 {
 			break
 		}
@@ -325,10 +342,43 @@ func (r *AppRuntime) RunStart(ctx context.Context, dir string, targetBaseDir str
 			output, execErr := promptExec.Execute(ctx, fixPrompt)
 			res.NepFixAttempts = round
 			if execErr == nil && output.Success {
-				// Re-verify NEP cleanliness after fix.
-				cleanOK, cleanErr := verify.CheckNepClean(res.TargetFile)
-				verifyResults[idx].NepCleanOK = cleanOK
-				verifyResults[idx].NepCleanError = cleanErr
+				refreshVerifyState(verifier, res.TargetFile, verifyResults[idx])
+			}
+		}
+	}
+
+	maxCompileFixRounds := r.cfg.Execution.RetryLimit
+	if maxCompileFixRounds <= 0 {
+		maxCompileFixRounds = 2
+	}
+	for round := 1; round <= maxCompileFixRounds; round++ {
+		compileFailedIdx := collectCompileFixIndices(results, verifyResults)
+		if len(compileFailedIdx) == 0 {
+			break
+		}
+
+		notify(WorkflowEvent{
+			Stage:   "compile-fix",
+			Message: fmt.Sprintf("编译失败修复（第 %d 轮，%d 个文件）", round, len(compileFailedIdx)),
+			Total:   len(compileFailedIdx),
+		})
+
+		for fixNum, idx := range compileFailedIdx {
+			res := results[idx]
+			vr := verifyResults[idx]
+			fixPrompt := gen.GenerateCompileFixPrompt(res.TargetFile, vr.CompileError, round)
+
+			notify(WorkflowEvent{
+				Stage:       "compile-fix",
+				Message:     fmt.Sprintf("修正 %s", filepath.Base(res.TargetFile)),
+				Current:     fixNum + 1,
+				Total:       len(compileFailedIdx),
+				CurrentFile: res.TargetFile,
+			})
+
+			output, execErr := promptExec.Execute(ctx, fixPrompt)
+			if execErr == nil && output.Success {
+				refreshVerifyState(verifier, res.TargetFile, verifyResults[idx])
 			}
 		}
 	}
@@ -353,6 +403,93 @@ func (r *AppRuntime) RunStart(ctx context.Context, dir string, targetBaseDir str
 		Verifies: verifyResults,
 		Report:   report,
 	}, nil
+}
+
+type compileChecker interface {
+	CheckCompile(targetFile string) (bool, string)
+}
+
+func collectNepFixIndices(results []*types.MigrationResult, verifyResults []*types.VerifyResult) []int {
+	var indices []int
+	for i, vr := range verifyResults {
+		if i >= len(results) || vr == nil || results[i] == nil {
+			continue
+		}
+		if !vr.NepCleanOK && vr.NepCleanError != "" && results[i].Success {
+			indices = append(indices, i)
+		}
+	}
+	return indices
+}
+
+func collectCompileFixIndices(results []*types.MigrationResult, verifyResults []*types.VerifyResult) []int {
+	var indices []int
+	for i, vr := range verifyResults {
+		if i >= len(results) || vr == nil || results[i] == nil {
+			continue
+		}
+		if results[i].Success && !vr.CompileOK && strings.TrimSpace(vr.CompileError) != "" {
+			indices = append(indices, i)
+		}
+	}
+	return indices
+}
+
+func refreshVerifyState(checker compileChecker, targetFile string, vr *types.VerifyResult) {
+	if checker == nil || vr == nil {
+		return
+	}
+	vr.NepCleanOK, vr.NepCleanError = verify.CheckNepClean(targetFile)
+	vr.CompileOK, vr.CompileError = checker.CheckCompile(targetFile)
+}
+
+func buildTypeScriptCompileCommand(verifyDir string, results []*types.MigrationResult) string {
+	tsconfigPath := findNearestTSConfigFromResults(results)
+	if tsconfigPath == "" {
+		tsconfigPath = findNearestTSConfigFromDir(verifyDir)
+	}
+
+	if tsconfigPath == "" {
+		return "npx tsc --noEmit"
+	}
+
+	projectRoot := filepath.Dir(tsconfigPath)
+	localTSC := filepath.Join(projectRoot, "node_modules", ".bin", "tsc")
+	if info, err := os.Stat(localTSC); err == nil && !info.IsDir() {
+		return localTSC + " --noEmit -p " + tsconfigPath
+	}
+	return "npx tsc --noEmit -p " + tsconfigPath
+}
+
+func findNearestTSConfigFromResults(results []*types.MigrationResult) string {
+	for _, result := range results {
+		if result == nil || strings.TrimSpace(result.TargetFile) == "" {
+			continue
+		}
+		if tsconfigPath := findNearestTSConfig(result.TargetFile); tsconfigPath != "" {
+			return tsconfigPath
+		}
+	}
+	return ""
+}
+
+func findNearestTSConfigFromDir(startDir string) string {
+	cur := filepath.Clean(strings.TrimSpace(startDir))
+	if cur == "" {
+		return ""
+	}
+	for cur != "" {
+		candidate := filepath.Join(cur, "tsconfig.json")
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+	return ""
 }
 
 type planItemMeta struct {
@@ -728,7 +865,7 @@ func resolveHelperReceiverCandidate(candidate *helperReceiverCandidate, tscp *co
 	}
 
 	for _, method := range allCandidateMethods(candidate) {
-		if methodDefinedInAnalysis(analysis, method) || containsMethodDefinition(sourceText, method) {
+		if helperMethodDefinedInModuleOrAncestors(moduleFile, analysis, sourceText, method, tscp, engine) {
 			resolution.ResolvedMethods = append(resolution.ResolvedMethods, method)
 			continue
 		}
@@ -1469,6 +1606,77 @@ func methodDefinedInAnalysis(a *types.FullAnalysis, method string) bool {
 		}
 	}
 	return false
+}
+
+func helperMethodDefinedInModuleOrAncestors(moduleFile string, analysis *types.FullAnalysis, sourceText string, method string, tscp *config.TsConfigPaths, engine *analyzer.Engine) bool {
+	visited := make(map[string]struct{})
+	return helperMethodDefinedInModuleOrAncestorsRecursive(filepath.Clean(moduleFile), analysis, sourceText, method, tscp, engine, visited)
+}
+
+func helperMethodDefinedInModuleOrAncestorsRecursive(moduleFile string, analysis *types.FullAnalysis, sourceText string, method string, tscp *config.TsConfigPaths, engine *analyzer.Engine, visited map[string]struct{}) bool {
+	moduleFile = filepath.Clean(strings.TrimSpace(moduleFile))
+	if moduleFile == "" {
+		return false
+	}
+	if _, ok := visited[moduleFile]; ok {
+		return false
+	}
+	visited[moduleFile] = struct{}{}
+
+	if analysis == nil {
+		if engine == nil {
+			return false
+		}
+		var err error
+		analysis, err = engine.AnalyzeFile(moduleFile)
+		if err != nil {
+			return false
+		}
+	}
+	if sourceText == "" {
+		sourceBytes, err := os.ReadFile(moduleFile)
+		if err != nil {
+			return false
+		}
+		sourceText = string(sourceBytes)
+	}
+
+	if methodDefinedInAnalysis(analysis, method) || containsMethodDefinition(sourceText, method) {
+		return true
+	}
+
+	parentFile := resolveInheritedModuleFile(moduleFile, analysis, tscp)
+	if parentFile == "" {
+		return false
+	}
+	return helperMethodDefinedInModuleOrAncestorsRecursive(parentFile, nil, "", method, tscp, engine, visited)
+}
+
+func resolveInheritedModuleFile(moduleFile string, analysis *types.FullAnalysis, tscp *config.TsConfigPaths) string {
+	if analysis == nil || analysis.AST == nil {
+		return ""
+	}
+
+	if importPath := strings.TrimSpace(analysis.AST.ExtendsImport); importPath != "" {
+		if resolved := resolveImportFile(moduleFile, importPath, tscp); resolved != "" {
+			return resolved
+		}
+	}
+
+	parentClass := strings.TrimSpace(analysis.AST.ExtendsFrom)
+	if parentClass == "" {
+		return ""
+	}
+
+	roots := []string{filepath.Dir(moduleFile)}
+	if tscp != nil && strings.TrimSpace(tscp.ProjectRoot) != "" {
+		roots = append(roots, tscp.ProjectRoot)
+	}
+	hits := scanFilesByBaseName(uniqueStrings(roots), parentClass)
+	if len(hits) == 0 {
+		return ""
+	}
+	return hits[0]
 }
 
 func containsMethodDefinition(text string, method string) bool {
