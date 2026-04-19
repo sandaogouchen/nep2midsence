@@ -2,6 +2,8 @@ package tui
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"sort"
@@ -482,7 +484,11 @@ export class OptimizationAndBiddingModule1MNBA {
 	}
 
 	if len(plan.ToExecuteHelpers) != 1 {
-		t.Fatalf("helper task count = %d, want 1", len(plan.ToExecuteHelpers))
+		var unresolved []types.UnresolvedHelper
+		if len(plan.ToExecuteCases) > 0 {
+			unresolved = plan.ToExecuteCases[0].UnresolvedHelpers
+		}
+		t.Fatalf("helper task count = %d, want 1 (cases=%d unresolved=%+v)", len(plan.ToExecuteHelpers), len(plan.ToExecuteCases), unresolved)
 	}
 
 	helper := plan.ToExecuteHelpers[0]
@@ -564,6 +570,9 @@ export class AdGroupPage {
 	}
 	if got.Method != "setBid" {
 		t.Fatalf("method = %q, want %q", got.Method, "setBid")
+	}
+	if !got.ReceiverReachable {
+		t.Fatal("expected unresolved helper to keep receiver reachable context")
 	}
 	if got.Reason == "" {
 		t.Fatal("expected unresolved helper reason to be populated")
@@ -656,7 +665,11 @@ export class CampaignPage {
 	}
 
 	if len(plan.ToExecuteHelpers) != 1 {
-		t.Fatalf("helper task count = %d, want 1", len(plan.ToExecuteHelpers))
+		var unresolved []types.UnresolvedHelper
+		if len(plan.ToExecuteCases) > 0 {
+			unresolved = plan.ToExecuteCases[0].UnresolvedHelpers
+		}
+		t.Fatalf("helper task count = %d, want 1 (cases=%d unresolved=%+v)", len(plan.ToExecuteHelpers), len(plan.ToExecuteCases), unresolved)
 	}
 	helper := plan.ToExecuteHelpers[0]
 	if helper.FilePath != componentPath {
@@ -673,6 +686,404 @@ export class CampaignPage {
 	}
 	if len(plan.ToExecuteCases[0].UnresolvedHelpers) != 0 {
 		t.Fatalf("unexpected unresolved helpers: %+v", plan.ToExecuteCases[0].UnresolvedHelpers)
+	}
+}
+
+func TestBuildMigrationPlanPromotesSharedMockDataImportOnce(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Source.Dir = dir
+	cfg.Target.BaseDir = filepath.Join(dir, "target-repo")
+	engine := analyzer.NewEngine(cfg)
+	engine.SetSourceRepoRoot(dir)
+
+	tsconfigPath := filepath.Join(dir, "tsconfig.json")
+	tsconfigSource := `{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@testData/*": ["./e2e/test_data/*"]
+    }
+  }
+}`
+	if err := os.WriteFile(tsconfigPath, []byte(tsconfigSource), 0o644); err != nil {
+		t.Fatalf("WriteFile(tsconfig): %v", err)
+	}
+
+	caseDir := filepath.Join(dir, "e2e", "tests", "brand")
+	if err := os.MkdirAll(caseDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(caseDir): %v", err)
+	}
+
+	mockDataPath := filepath.Join(dir, "e2e", "test_data", "mock-data.ts")
+	if err := os.MkdirAll(filepath.Dir(mockDataPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(mockData dir): %v", err)
+	}
+	mockDataSource := `export const MockFeatureEnabledResponseBrandAuction = {
+  status: 200,
+  body: { data: { white_value: [] } },
+};`
+	if err := os.WriteFile(mockDataPath, []byte(mockDataSource), 0o644); err != nil {
+		t.Fatalf("WriteFile(mockData): %v", err)
+	}
+
+	caseSource := `import { MockFeatureEnabledResponseBrandAuction } from '@testData/mock-data';
+
+const BrandActionCreation = (page) =>
+  page.intercept('/api/v3/i18n/account/features_enabled/', MockFeatureEnabledResponseBrandAuction);
+
+before(async ({ page }) => {
+  await BrandActionCreation(page);
+});
+
+test("case", async () => {
+  expect(MockFeatureEnabledResponseBrandAuction.status).toBe(200);
+});`
+
+	caseOnePath := filepath.Join(caseDir, "case-one.spec.ts")
+	if err := os.WriteFile(caseOnePath, []byte(caseSource), 0o644); err != nil {
+		t.Fatalf("WriteFile(caseOne): %v", err)
+	}
+	caseTwoPath := filepath.Join(caseDir, "case-two.spec.ts")
+	if err := os.WriteFile(caseTwoPath, []byte(strings.ReplaceAll(caseSource, `"case"`, `"case-two"`)), 0o644); err != nil {
+		t.Fatalf("WriteFile(caseTwo): %v", err)
+	}
+
+	analyses, err := engine.AnalyzeDir(dir)
+	if err != nil {
+		t.Fatalf("AnalyzeDir: %v", err)
+	}
+
+	plan, err := buildMigrationPlan(cfg, engine, analyses, nil)
+	if err != nil {
+		t.Fatalf("buildMigrationPlan: %v", err)
+	}
+
+	if len(plan.ToExecuteHelpers) != 1 {
+		t.Fatalf("shared dependency task count = %d, want 1", len(plan.ToExecuteHelpers))
+	}
+
+	dep := plan.ToExecuteHelpers[0]
+	if dep.TaskKind != "dependency" {
+		t.Fatalf("task kind = %q, want %q", dep.TaskKind, "dependency")
+	}
+	if dep.FilePath != mockDataPath {
+		t.Fatalf("dependency source = %q, want %q", dep.FilePath, mockDataPath)
+	}
+
+	wantTarget := filepath.Join(cfg.Target.BaseDir, "e2e", "test_data", "mock-data.ts")
+	if dep.TargetPath != wantTarget {
+		t.Fatalf("dependency target = %q, want %q", dep.TargetPath, wantTarget)
+	}
+
+	for _, ca := range plan.ToExecuteCases {
+		found := false
+		for _, p := range ca.Dependencies {
+			if p == wantTarget {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("case %q missing shared dependency target %q in Dependencies: %v", ca.FilePath, wantTarget, ca.Dependencies)
+		}
+	}
+}
+
+func TestBuildMigrationPlanPromotesSharedHookThroughBarrelImport(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Source.Dir = dir
+	cfg.Target.BaseDir = filepath.Join(dir, "target-repo")
+	engine := analyzer.NewEngine(cfg)
+	engine.SetSourceRepoRoot(dir)
+
+	tsconfigPath := filepath.Join(dir, "tsconfig.json")
+	if err := os.WriteFile(tsconfigPath, []byte(`{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@utils/*": ["./e2e/utils/*"]
+    }
+  }
+}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(tsconfig): %v", err)
+	}
+
+	barrelPath := filepath.Join(dir, "e2e", "utils", "index.ts")
+	if err := os.MkdirAll(filepath.Dir(barrelPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(barrel): %v", err)
+	}
+	if err := os.WriteFile(barrelPath, []byte(`export * from './describe-before';`), 0o644); err != nil {
+		t.Fatalf("WriteFile(barrel): %v", err)
+	}
+
+	concretePath := filepath.Join(dir, "e2e", "utils", "describe-before", "index.ts")
+	if err := os.MkdirAll(filepath.Dir(concretePath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(concrete): %v", err)
+	}
+	if err := os.WriteFile(concretePath, []byte(`export const commonAfter = async () => {
+  console.log("real hook");
+};`), 0o644); err != nil {
+		t.Fatalf("WriteFile(concrete): %v", err)
+	}
+
+	caseDir := filepath.Join(dir, "e2e", "tests", "brand")
+	if err := os.MkdirAll(caseDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(caseDir): %v", err)
+	}
+	casePath := filepath.Join(caseDir, "case.spec.ts")
+	if err := os.WriteFile(casePath, []byte(`import { after, test } from '@playwright/test';
+import { commonAfter } from '@utils/index';
+
+after(commonAfter);
+test("case", async () => {});`), 0o644); err != nil {
+		t.Fatalf("WriteFile(case): %v", err)
+	}
+
+	analyses, err := engine.AnalyzeDir(dir)
+	if err != nil {
+		t.Fatalf("AnalyzeDir: %v", err)
+	}
+
+	plan, err := buildMigrationPlan(cfg, engine, analyses, nil)
+	if err != nil {
+		t.Fatalf("buildMigrationPlan: %v", err)
+	}
+
+	if len(plan.ToExecuteHelpers) != 1 {
+		t.Fatalf("shared dependency task count = %d, want 1", len(plan.ToExecuteHelpers))
+	}
+
+	dep := plan.ToExecuteHelpers[0]
+	if dep.TaskKind != "dependency" {
+		t.Fatalf("task kind = %q, want %q", dep.TaskKind, "dependency")
+	}
+	if dep.FilePath != concretePath {
+		t.Fatalf("dependency source = %q, want %q", dep.FilePath, concretePath)
+	}
+
+	wantTarget := filepath.Join(cfg.Target.BaseDir, "e2e", "utils", "describe-before", "index.ts")
+	if dep.TargetPath != wantTarget {
+		t.Fatalf("dependency target = %q, want %q", dep.TargetPath, wantTarget)
+	}
+
+	if len(plan.ToExecuteCases) != 1 {
+		t.Fatalf("case task count = %d, want 1", len(plan.ToExecuteCases))
+	}
+	found := false
+	for _, p := range plan.ToExecuteCases[0].Dependencies {
+		if p == wantTarget {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("case dependencies = %v, want to include %q", plan.ToExecuteCases[0].Dependencies, wantTarget)
+	}
+}
+
+func TestBuildMigrationPlanDiscoversDirectInstantiatedHelperMethods(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Source.Dir = dir
+	engine := analyzer.NewEngine(cfg)
+
+	tsconfigPath := filepath.Join(dir, "tsconfig.json")
+	if err := os.WriteFile(tsconfigPath, []byte(`{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@pages/*": ["./e2e/pages/*"]
+    }
+  }
+}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(tsconfig): %v", err)
+	}
+
+	helperFile := filepath.Join(dir, "e2e", "pages", "new_pages", "creativePage", "module", "AdNameModule", "AdNameModule.ts")
+	if err := os.MkdirAll(filepath.Dir(helperFile), 0o755); err != nil {
+		t.Fatalf("MkdirAll(helper): %v", err)
+	}
+	if err := os.WriteFile(helperFile, []byte(`export class AdNameModule {
+  constructor(page: unknown) {
+    void page;
+  }
+
+  async setAdName(adName: string) {
+    console.log(adName);
+  }
+}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(helper): %v", err)
+	}
+
+	caseDir := filepath.Join(dir, "e2e", "tests", "brand")
+	if err := os.MkdirAll(caseDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(caseDir): %v", err)
+	}
+	casePath := filepath.Join(caseDir, "case.spec.ts")
+	if err := os.WriteFile(casePath, []byte(`import { AdNameModule } from "@pages/new_pages/creativePage/module/AdNameModule/AdNameModule";
+
+test("case", async ({ page }) => {
+  const adNameModule = new AdNameModule(page);
+  await adNameModule.setAdName("creative");
+});`), 0o644); err != nil {
+		t.Fatalf("WriteFile(case): %v", err)
+	}
+
+	analyses, err := engine.AnalyzeDir(dir)
+	if err != nil {
+		t.Fatalf("AnalyzeDir: %v", err)
+	}
+
+	plan, err := buildMigrationPlan(cfg, engine, analyses, nil)
+	if err != nil {
+		t.Fatalf("buildMigrationPlan: %v", err)
+	}
+
+	if len(plan.ToExecuteHelpers) != 1 {
+		var unresolved []types.UnresolvedHelper
+		if len(plan.ToExecuteCases) > 0 {
+			unresolved = plan.ToExecuteCases[0].UnresolvedHelpers
+		}
+		t.Fatalf("helper task count = %d, want 1 (cases=%d unresolved=%+v)", len(plan.ToExecuteHelpers), len(plan.ToExecuteCases), unresolved)
+	}
+	helper := plan.ToExecuteHelpers[0]
+	if helper.FilePath != helperFile {
+		t.Fatalf("helper source = %q, want %q", helper.FilePath, helperFile)
+	}
+	if helper.HelperPlan == nil {
+		t.Fatal("expected helper plan metadata on helper task")
+	}
+	if strings.Join(helper.HelperPlan.Methods, ",") != "setAdName" {
+		t.Fatalf("helper methods = %v, want [setAdName]", helper.HelperPlan.Methods)
+	}
+	if len(plan.ToExecuteCases) != 1 {
+		t.Fatalf("case task count = %d, want 1", len(plan.ToExecuteCases))
+	}
+	if len(plan.ToExecuteCases[0].UnresolvedHelpers) != 0 {
+		t.Fatalf("unexpected unresolved helpers: %+v", plan.ToExecuteCases[0].UnresolvedHelpers)
+	}
+}
+
+func TestResolveHelperReceiverCandidateRejectsDirectoryModulePath(t *testing.T) {
+	dir := t.TempDir()
+
+	candidate := &helperReceiverCandidate{
+		Receiver:       "adNameModule",
+		PageObjectFile: dir,
+		MethodsByCase: map[string]map[string]struct{}{
+			filepath.Join(dir, "case.spec.ts"): {
+				"setAdName": {},
+			},
+		},
+	}
+
+	_, err := resolveHelperReceiverCandidate(candidate, nil, analyzer.NewEngine(config.DefaultConfig()))
+	if err == nil {
+		t.Fatal("expected directory path to be rejected")
+	}
+	if !strings.Contains(err.Error(), "directory") {
+		t.Fatalf("error = %q, want to mention directory", err)
+	}
+}
+
+func TestBuildMigrationPlanSkipsUpToDateSharedMockDataDependency(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Source.Dir = dir
+	cfg.Target.BaseDir = filepath.Join(dir, "target-repo")
+	engine := analyzer.NewEngine(cfg)
+	engine.SetSourceRepoRoot(dir)
+
+	tsconfigPath := filepath.Join(dir, "tsconfig.json")
+	if err := os.WriteFile(tsconfigPath, []byte(`{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@testData/*": ["./e2e/test_data/*"]
+    }
+  }
+}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(tsconfig): %v", err)
+	}
+
+	caseDir := filepath.Join(dir, "e2e", "tests")
+	if err := os.MkdirAll(caseDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(caseDir): %v", err)
+	}
+
+	mockDataPath := filepath.Join(dir, "e2e", "test_data", "mock-data.ts")
+	if err := os.MkdirAll(filepath.Dir(mockDataPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(mockData dir): %v", err)
+	}
+	mockDataSource := `export const MockFeatureEnabledResponseBrandAuction = { status: 200 };`
+	if err := os.WriteFile(mockDataPath, []byte(mockDataSource), 0o644); err != nil {
+		t.Fatalf("WriteFile(mockData): %v", err)
+	}
+
+	casePath := filepath.Join(caseDir, "case.spec.ts")
+	if err := os.WriteFile(casePath, []byte(`import { MockFeatureEnabledResponseBrandAuction } from '@testData/mock-data';
+test("case", async () => {
+  expect(MockFeatureEnabledResponseBrandAuction.status).toBe(200);
+});`), 0o644); err != nil {
+		t.Fatalf("WriteFile(case): %v", err)
+	}
+
+	store, err := executor.NewStateStore(dir)
+	if err != nil {
+		t.Fatalf("NewStateStore: %v", err)
+	}
+	runID := "run-shared-dep"
+	now := time.Now()
+	if err := store.StartRun(runID, dir, cfg.Target.BaseDir, 1, now); err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+
+	targetPath := filepath.Join(cfg.Target.BaseDir, "e2e", "test_data", "mock-data.ts")
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(targetDir): %v", err)
+	}
+	if err := os.WriteFile(targetPath, []byte(mockDataSource), 0o644); err != nil {
+		t.Fatalf("WriteFile(target): %v", err)
+	}
+
+	hashBytes, err := os.ReadFile(mockDataPath)
+	if err != nil {
+		t.Fatalf("ReadFile(mockData): %v", err)
+	}
+	sum := sha256.Sum256(hashBytes)
+	taskKey := defaultTaskKey("dependency", mockDataPath)
+	if err := store.RecordTaskResult(runID, taskKey, mockDataPath, "completed", "", "dependency", hex.EncodeToString(sum[:]), targetPath, now.Add(time.Second)); err != nil {
+		t.Fatalf("RecordTaskResult: %v", err)
+	}
+	if err := store.CompleteRun(runID, "completed", now.Add(2*time.Second)); err != nil {
+		t.Fatalf("CompleteRun: %v", err)
+	}
+
+	analyses, err := engine.AnalyzeDir(dir)
+	if err != nil {
+		t.Fatalf("AnalyzeDir: %v", err)
+	}
+
+	plan, err := buildMigrationPlan(cfg, engine, analyses, store)
+	if err != nil {
+		t.Fatalf("buildMigrationPlan: %v", err)
+	}
+
+	if len(plan.ToExecuteHelpers) != 0 {
+		t.Fatalf("shared dependency task count = %d, want 0 when up-to-date", len(plan.ToExecuteHelpers))
+	}
+
+	foundSkipped := false
+	for _, meta := range plan.Skipped {
+		if meta.TaskKey == taskKey && meta.Kind == "dependency" {
+			foundSkipped = true
+			break
+		}
+	}
+	if !foundSkipped {
+		t.Fatalf("expected dependency task %q to be skipped, got %#v", taskKey, plan.Skipped)
 	}
 }
 

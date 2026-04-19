@@ -7,13 +7,11 @@
 ```typescript
 import { MidsceneCaseFunctionParams } from '@byted-midscene/pagepass-plugin';
 import type { CaseFunctionParams } from '@pagepass/test';
-
-describe('vv_cbo_standard6s_cta', () => {
+import { SET_UP_CAMPAIGN_COOKIES } from '@pages/WebAds/utils/create_ads_common/CaseCommon';
+describe('case_name', () => {
   before(async ({ page }) => {
-    await 原 case 中的 before 注入函数(page);
+    await SET_UP_CAMPAIGN_COOKIES(page, advId);
   });
-  before(commonBeforeForBrandAuction);
-
   it('case 名称', async (params: CaseFunctionParams<'test'>) => {
     const { page } = params;
     const { midscene } = params as MidsceneCaseFunctionParams;

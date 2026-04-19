@@ -596,7 +596,13 @@ func (m Model) renderRunningView() string {
 	contentWidth := maxInt(40, m.width-2)
 	stage := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81")).Render(strings.ToUpper(emptyFallback(m.currentStage, "queued")))
 	current := lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Render(emptyFallback(m.currentFile, "-"))
-	header := joinEdge("Running "+stage+"  "+current, renderProgressSummary(m.progressCurrent, m.progressTotal), contentWidth)
+	var progressIndicator string
+	if m.currentStage == "scan" {
+		progressIndicator = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("⟳ scanning…")
+	} else {
+		progressIndicator = renderProgressSummary(m.progressCurrent, m.progressTotal)
+	}
+	header := joinEdge("Running "+stage+"  "+current, progressIndicator, contentWidth)
 
 	logs := strings.Join(m.visibleLogs(), "\n")
 	if strings.TrimSpace(logs) == "" {

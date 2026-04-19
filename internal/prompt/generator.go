@@ -30,6 +30,7 @@ type PromptData struct {
 	TaskKind          string
 	RelatedFiles      []string
 	LocalImportDeps   []LocalImportDepEntry
+	SharedSymbolDeps  []SharedSymbolDepEntry
 	ReferenceDocs     []string
 	APIMappings       []MappingEntry
 	OperationSteps    []OperationStep
@@ -49,10 +50,10 @@ type PromptData struct {
 	TargetRepoRoot    string
 
 	// commonIt wrapper fields (FR-3)
-	HasCommonItWrapper       bool
+	HasCommonItWrapper         bool
 	WrapperInjectedPageObjects []string
-	WrapperUrl               string
-	WrapperOptions           string
+	WrapperUrl                 string
+	WrapperOptions             string
 }
 
 type MappingEntry struct {
@@ -94,6 +95,15 @@ type LocalImportDepEntry struct {
 	SourceFile string
 }
 
+type SharedSymbolDepEntry struct {
+	ImportedName   string
+	ImportPath     string
+	ImportSpec     string
+	ExportFile     string
+	TargetFile     string
+	DependencyKind string
+}
+
 type DataFlowEntry struct {
 	Variable  string
 	Kind      string
@@ -131,7 +141,7 @@ func NewGenerator(cfg *config.Config) *Generator {
 
 	// Parse template
 	funcMap := template.FuncMap{
-		"add": func(a, b int) int { return a + b },
+		"add":      func(a, b int) int { return a + b },
 		"contains": strings.Contains,
 	}
 	g.tmpl = template.Must(template.New("migration").Funcs(funcMap).Parse(migrationTemplate))
@@ -274,6 +284,19 @@ func (g *Generator) buildPromptData(analysis *types.FullAnalysis) *PromptData {
 			ReceiverReachable: item.ReceiverReachable,
 		})
 	}
+	for _, dep := range analysis.ResolvedSymbolDeps {
+		if !dep.IsSharedPreferred {
+			continue
+		}
+		data.SharedSymbolDeps = append(data.SharedSymbolDeps, SharedSymbolDepEntry{
+			ImportedName:   dep.ImportedName,
+			ImportPath:     dep.ImportPath,
+			ImportSpec:     dep.ImportSpec,
+			ExportFile:     dep.ExportFile,
+			TargetFile:     dep.TargetFile,
+			DependencyKind: dep.DependencyKind,
+		})
+	}
 
 	// Build DEFAULT_PROMPT entries (filled when analysis.DefaultPrompts is present)
 	for _, dp := range analysis.DefaultPrompts {
@@ -373,6 +396,13 @@ func (g *Generator) buildPromptData(analysis *types.FullAnalysis) *PromptData {
 			"保持原文件骨架和已有代码，仅补充这些方法所需的最小 import、字段和实例化依赖",
 		)
 	}
+	if analysis.TaskKind == "dependency" {
+		data.Constraints = append(data.Constraints,
+			"这是一个共享依赖迁移任务：将该源依赖文件迁移到目标路径，供多个 case 复用；不要把同一个 mock/常量在每个 case 内重复内联",
+			"迁移前先检查目标文件是否已经存在且内容可复用；若已迁移则保持现状，不要重复生成等价副本",
+			"若文件不含 NEP 逻辑，不要强行改写为 Midscene，只需保留当前依赖文件对 case 生效所需的最小 export / import 结构",
+		)
+	}
 	if len(data.UnresolvedHelpers) > 0 {
 		for _, item := range data.UnresolvedHelpers {
 			if item.ReceiverReachable {
@@ -382,9 +412,14 @@ func (g *Generator) buildPromptData(analysis *types.FullAnalysis) *PromptData {
 			} else {
 				// FR-5: Unreachable receiver — preserve original call with TODO
 				data.Constraints = append(data.Constraints,
-					fmt.Sprintf("不可达 helper 依赖：保留原调用 %s.%s，并在调用前添加 TODO 注释：// TODO(nep2midsence): helper dependency not migrated: %s.%s；原因：%s", item.Receiver, item.Method, item.Receiver, item.Method, item.Reason))
+					fmt.Sprintf("不可达 helper 依赖：保留原调用 %s.%s，并在调用前添加 TODO 注释：// ⚠️⚠️⚠️TODO(nep2midsence): helper dependency not migrated: %s.%s；原因：%s", item.Receiver, item.Method, item.Receiver, item.Method, item.Reason))
 			}
 		}
+	}
+	if len(data.SharedSymbolDeps) > 0 {
+		data.Constraints = append(data.Constraints,
+			"共享符号依赖不得在 case 内重定义；必须从迁移后的共享依赖文件 import",
+			"若共享符号来自源仓库 barrel import，必须改写为目标仓库内可解析的 concrete migrated dependency import")
 	}
 
 	// Cross-repo mode: inject additional constraints
@@ -894,7 +929,60 @@ func (g *Generator) GenerateNepFixPrompt(targetFile string, nepMarkers string, a
 
 // GenerateCompileFixPrompt creates a targeted prompt for repairing compiler
 // errors after the initial migration and NEP cleanup passes have finished.
-func (g *Generator) GenerateCompileFixPrompt(targetFile string, compileError string, attempt int) string {
+func (g *Generator) GenerateCompileFixPrompt(analysis *types.FullAnalysis, targetFile string, compileError string, attempt int) string {
+	var extra strings.Builder
+
+	if analysis != nil {
+		relatedFiles := uniqueNonEmpty(append([]string{analysis.FilePath}, analysis.Dependencies...))
+		localDeps := g.buildLocalImportDeps(analysis)
+		wrapperInjected := collectWrapperInjectedPageObjects(analysis)
+
+		if len(relatedFiles) > 0 || len(localDeps) > 0 || len(wrapperInjected) > 0 || len(analysis.UnresolvedHelpers) > 0 {
+			extra.WriteString("\n---\n\n### 附加上下文\n\n")
+		}
+
+		if len(relatedFiles) > 0 {
+			extra.WriteString("#### 相关文件（先 Read 再修）\n\n")
+			for _, file := range relatedFiles {
+				extra.WriteString("- `" + file + "`\n")
+			}
+			extra.WriteString("\n")
+		}
+
+		if len(localDeps) > 0 {
+			extra.WriteString("#### 源文件本地依赖 import\n\n")
+			extra.WriteString("| import path | 当前文件实际引用 | 源文件 |\n")
+			extra.WriteString("|---|---|---|\n")
+			for _, dep := range localDeps {
+				extra.WriteString(fmt.Sprintf("| `%s` | `%s` | `%s` |\n", dep.ImportPath, dep.ImportSpec, dep.SourceFile))
+			}
+			extra.WriteString("\n")
+		}
+
+		if len(wrapperInjected) > 0 {
+			extra.WriteString("#### Wrapper 注入参数\n\n")
+			extra.WriteString("这些参数来自 commonIt/wrapper 运行时注入，不是真实 import 依赖：\n")
+			for _, name := range wrapperInjected {
+				extra.WriteString("- `" + name + "`\n")
+			}
+			extra.WriteString("\n缺少这些符号时，不要在 case 中伪造 `const x: any = {}`、`async () => null` 一类占位对象；应当导入或实例化真实 page object / helper。\n\n")
+		}
+
+		if len(analysis.UnresolvedHelpers) > 0 {
+			extra.WriteString("#### Helper 依赖状态\n\n")
+			extra.WriteString("| receiver | method | reason | 可达性 |\n")
+			extra.WriteString("|---|---|---|---|\n")
+			for _, item := range analysis.UnresolvedHelpers {
+				reachability := "不可达"
+				if item.ReceiverReachable {
+					reachability = "可达"
+				}
+				extra.WriteString(fmt.Sprintf("| `%s` | `%s` | %s | %s |\n", item.Receiver, item.Method, item.Reason, reachability))
+			}
+			extra.WriteString("\n")
+		}
+	}
+
 	return fmt.Sprintf(`## 编译失败修复任务（第 %d 次修正）
 
 **严格按照以下指令执行，不要做额外的事情。**
@@ -920,6 +1008,7 @@ func (g *Generator) GenerateCompileFixPrompt(targetFile string, compileError str
    - 这类依赖不一定是 NEP 依赖，也可能是普通本地依赖、alias 依赖或跨仓库依赖
    - 若目标仓库没有同名模块，必须把当前文件实际用到的最小实现迁移进来，或改写为目标仓库内可解析的本地依赖
 4. **Write** 修正后的完整文件到原路径 `+"`%s`"+`
+%s
 
 ---
 
@@ -929,5 +1018,30 @@ func (g *Generator) GenerateCompileFixPrompt(targetFile string, compileError str
 2. 不需要运行测试，只需要确保编译通过
 3. 尽量保持业务逻辑不变
 4. 不要保留会导致当前仓库无法解析的 import
-`, attempt, targetFile, compileError, targetFile, targetFile)
+5. 不要通过定义假的占位对象、假的 page object、`+"`"+`any`+"`"+` 空壳、`+"`"+`async () => null`+"`"+`、空实现函数来消除编译报错
+6. 如果缺少的是 wrapper 注入参数，必须导入或实例化真实对象，不要在 case 内伪造同名变量
+7. 如果 helper receiver 可达，优先迁移/补齐真实 helper 或改写调用；只有明确不可达时才允许保留 TODO
+`, attempt, targetFile, compileError, targetFile, targetFile, extra.String())
+}
+
+func collectWrapperInjectedPageObjects(analysis *types.FullAnalysis) []string {
+	if analysis == nil {
+		return nil
+	}
+
+	names := append([]string(nil), analysis.WrapperInjectedParams...)
+	if analysis.AST != nil {
+		for _, fn := range analysis.AST.Functions {
+			if !fn.IsTest || strings.TrimSpace(fn.WrapperName) == "" {
+				continue
+			}
+			for _, name := range fn.WrapperInjectedParams {
+				if name == "page" || name == "midscene" || name == "agent" {
+					continue
+				}
+				names = append(names, name)
+			}
+		}
+	}
+	return uniqueNonEmpty(names)
 }

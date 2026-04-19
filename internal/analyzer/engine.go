@@ -29,6 +29,10 @@ type Engine struct {
 // AnalyzeProgressFunc reports completed file count during directory analysis.
 type AnalyzeProgressFunc func(current, total int, filePath string)
 
+// ScanProgressFunc reports directory scanning progress: matched files found so far
+// and the current path being visited.
+type ScanProgressFunc func(matchedSoFar int, currentPath string)
+
 func NewEngine(cfg *config.Config) *Engine {
 	customMappings := make(map[string]*types.MigrationRule)
 	for apiName, cm := range cfg.CustomMappings {
@@ -150,12 +154,12 @@ func (e *Engine) analyzeTypeScriptFile(filePath string, result *types.FullAnalys
 
 // AnalyzeDir analyzes all matching files in a directory
 func (e *Engine) AnalyzeDir(dir string) ([]*types.FullAnalysis, error) {
-	return e.AnalyzeDirWithProgress(dir, nil)
+	return e.AnalyzeDirWithProgress(dir, nil, nil)
 }
 
 // AnalyzeDirWithProgress analyzes all matching files in a directory and reports
 // per-file completion progress after each file analysis attempt.
-func (e *Engine) AnalyzeDirWithProgress(dir string, progress AnalyzeProgressFunc) ([]*types.FullAnalysis, error) {
+func (e *Engine) AnalyzeDirWithProgress(dir string, progress AnalyzeProgressFunc, scanProgress ScanProgressFunc) ([]*types.FullAnalysis, error) {
 	// In cross-repo mode, auto-detect source repo root if not set.
 	if e.cfg.IsCrossRepo() && e.sourceRepoRoot == "" {
 		e.sourceRepoRoot = DetectSourceRepoRoot(dir)
@@ -169,7 +173,7 @@ func (e *Engine) AnalyzeDirWithProgress(dir string, progress AnalyzeProgressFunc
 		targetBaseAbs, _ = filepath.Abs(e.cfg.Target.BaseDir)
 	}
 
-	files, err := e.collectAnalyzableFiles(dir, targetBaseAbs)
+	files, err := e.collectAnalyzableFiles(dir, targetBaseAbs, scanProgress)
 	if err != nil {
 		return nil, err
 	}
@@ -190,7 +194,7 @@ func (e *Engine) AnalyzeDirWithProgress(dir string, progress AnalyzeProgressFunc
 	return results, nil
 }
 
-func (e *Engine) collectAnalyzableFiles(dir string, targetBaseAbs string) ([]string, error) {
+func (e *Engine) collectAnalyzableFiles(dir string, targetBaseAbs string, scanProgress ScanProgressFunc) ([]string, error) {
 	var files []string
 
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
@@ -200,6 +204,9 @@ func (e *Engine) collectAnalyzableFiles(dir string, targetBaseAbs string) ([]str
 		if info.IsDir() {
 			if e.shouldSkipDir(path, info.Name(), targetBaseAbs) {
 				return filepath.SkipDir
+			}
+			if scanProgress != nil {
+				scanProgress(len(files), path)
 			}
 			return nil
 		}

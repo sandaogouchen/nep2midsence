@@ -158,6 +158,24 @@ const migrationTemplate = `## 迁移任务
 **注意**：表中 SourceFile 标记为 "(unresolved alias ...)" 的行表示该 alias 在目标仓库无法解析，必须内联或改写。
 {{end}}
 
+{{if .SharedSymbolDeps}}
+#### 6.4 共享符号依赖（禁止在 case 内重定义）
+
+以下符号已经被识别为共享依赖。迁移时必须保留为 import，不得在 case 内重新声明同名 ` + "`" + `const` + "`" + ` / ` + "`" + `enum` + "`" + ` / ` + "`" + `function` + "`" + ` / noop stub：
+
+| symbol | source import | import spec | concrete export file | target dependency file | kind |
+|---|---|---|---|---|---|
+{{range .SharedSymbolDeps -}}
+| ` + "`" + `{{.ImportedName}}` + "`" + ` | ` + "`" + `{{.ImportPath}}` + "`" + ` | ` + "`" + `{{.ImportSpec}}` + "`" + ` | ` + "`" + `{{.ExportFile}}` + "`" + ` | ` + "`" + `{{.TargetFile}}` + "`" + ` | ` + "`" + `{{.DependencyKind}}` + "`" + ` |
+{{end}}
+
+处理要求：
+
+- 禁止在 case 内重定义上述共享符号
+- 必须从迁移后的目标依赖文件 import
+- 若源仓库通过 barrel re-export 暴露该符号，迁移后应指向 concrete migrated dependency，而不是继续依赖不可解析的源仓库 alias
+{{end}}
+
 {{if .ExampleBefore}}
 ---
 

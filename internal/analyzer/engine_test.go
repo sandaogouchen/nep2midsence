@@ -145,7 +145,7 @@ func TestAnalyzeDirWithProgressSkipsOutputDirectoryAndReportsStableTotals(t *tes
 
 	results, err := engine.AnalyzeDirWithProgress(dir, func(current, total int, filePath string) {
 		events = append(events, progressEvent{current: current, total: total, file: filePath})
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("AnalyzeDirWithProgress: %v", err)
 	}
@@ -183,7 +183,7 @@ func TestAnalyzeDirWithProgressContinuesAfterFileFailure(t *testing.T) {
 
 	results, err := engine.AnalyzeDirWithProgress(dir, func(current, total int, filePath string) {
 		events = append(events, progressEvent{current: current, total: total, file: filePath})
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("AnalyzeDirWithProgress: %v", err)
 	}

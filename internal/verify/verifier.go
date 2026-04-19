@@ -89,11 +89,13 @@ func (v *Verifier) checkCompile(targetFile string) (bool, string) {
 	cmd := exec.Command(parts[0], args...)
 	cmd.Dir = v.projectDir
 
+	var stdout bytes.Buffer
 	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		output := stderr.String()
+		output := stdout.String() + stderr.String()
 		if strings.TrimSpace(output) == "" {
 			output = err.Error()
 		}

@@ -32,6 +32,10 @@ type FullAnalysis struct {
 	// migration.
 	UnresolvedHelpers []UnresolvedHelper `json:"unresolved_helpers,omitempty"`
 
+	// ResolvedSymbolDeps records symbol-level local-import resolution, including
+	// barrel re-export tracing and shared-dependency preferences.
+	ResolvedSymbolDeps []ResolvedSymbolDependency `json:"resolved_symbol_deps,omitempty"`
+
 	// WrapperInjectedParams lists parameter names injected by the wrapper (e.g., commonIt).
 	// These are fake dependencies that should NOT be migrated as real imports.
 	WrapperInjectedParams []string `json:"wrapper_injected_params,omitempty"`
@@ -135,6 +139,19 @@ type HelperMigrationPlan struct {
 	Receiver       string   `json:"receiver"`
 	PageObjectFile string   `json:"page_object_file,omitempty"`
 	Methods        []string `json:"methods,omitempty"`
+}
+
+type ResolvedSymbolDependency struct {
+	ImportPath        string `json:"import_path"`
+	ImportSpec        string `json:"import_spec,omitempty"`
+	ImportedName      string `json:"imported_name"`
+	LocalAlias        string `json:"local_alias,omitempty"`
+	BarrelFile        string `json:"barrel_file,omitempty"`
+	ExportFile        string `json:"export_file,omitempty"`
+	ExportName        string `json:"export_name,omitempty"`
+	TargetFile        string `json:"target_file,omitempty"`
+	DependencyKind    string `json:"dependency_kind,omitempty"`
+	IsSharedPreferred bool   `json:"is_shared_preferred,omitempty"`
 }
 
 type UnresolvedHelper struct {

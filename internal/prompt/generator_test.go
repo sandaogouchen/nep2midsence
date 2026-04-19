@@ -153,8 +153,44 @@ func TestGenerateSkipsInfrastructureOwnerSteps(t *testing.T) {
 func TestGenerateCompileFixPromptMentionsCompilerErrorsAndDependencies(t *testing.T) {
 	cfg := config.DefaultConfig()
 	g := NewGenerator(cfg)
+	dir := t.TempDir()
+	sourceFile := filepath.Join(dir, "source.spec.ts")
+	depFile := filepath.Join(dir, "pages", "CreativePage.ts")
+	if err := os.MkdirAll(filepath.Dir(depFile), 0o755); err != nil {
+		t.Fatalf("MkdirAll(dep): %v", err)
+	}
+	if err := os.WriteFile(sourceFile, []byte(`test("x", async () => {})`), 0o644); err != nil {
+		t.Fatalf("WriteFile(source): %v", err)
+	}
+	if err := os.WriteFile(depFile, []byte(`export class CreativePage {}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(dep): %v", err)
+	}
+
+	analysis := &types.FullAnalysis{
+		FilePath:   sourceFile,
+		TargetPath: "/tmp/case.spec.ts",
+		Language:   "typescript",
+		Dependencies: []string{
+			depFile,
+		},
+		AST: &types.ASTInfo{
+			Functions: []types.FuncInfo{{
+				Name:                  "x",
+				IsTest:                true,
+				WrapperName:           "commonIt",
+				WrapperInjectedParams: []string{"creativePage"},
+			}},
+		},
+		UnresolvedHelpers: []types.UnresolvedHelper{{
+			Receiver:          "creativePage.publishBtn",
+			Method:            "getElement",
+			Reason:            "method definition not found",
+			ReceiverReachable: true,
+		}},
+	}
 
 	promptText := g.GenerateCompileFixPrompt(
+		analysis,
 		"/tmp/case.spec.ts",
 		"TypeScript compile failed: missing modules (1)\n@utils/index",
 		2,
@@ -171,6 +207,15 @@ func TestGenerateCompileFixPromptMentionsCompilerErrorsAndDependencies(t *testin
 	}
 	if !strings.Contains(promptText, "不需要运行测试") {
 		t.Fatalf("prompt should explicitly skip tests: %s", promptText)
+	}
+	if !strings.Contains(promptText, "creativePage") || !strings.Contains(promptText, "wrapper") {
+		t.Fatalf("prompt missing wrapper context: %s", promptText)
+	}
+	if !strings.Contains(promptText, "不要通过定义假的占位对象") {
+		t.Fatalf("prompt missing anti-stub constraint: %s", promptText)
+	}
+	if !strings.Contains(promptText, depFile) {
+		t.Fatalf("prompt missing related file context: %s", promptText)
 	}
 }
 
@@ -297,6 +342,71 @@ test("x", async () => {
 	}
 	if !strings.Contains(promptText, "不能直接原样保留") {
 		t.Fatalf("prompt missing cross-repo alias rewrite constraint: %s", promptText)
+	}
+}
+
+func TestGenerateCrossRepoPromptIncludesSharedSymbolDependencies(t *testing.T) {
+	cfg := config.DefaultConfig()
+	dir := t.TempDir()
+	cfg.Source.Dir = dir
+	cfg.Target.BaseDir = filepath.Join(dir, "target-repo")
+	g := NewGenerator(cfg)
+
+	casePath := filepath.Join(dir, "e2e", "tests", "brand", "case.spec.ts")
+	if err := os.MkdirAll(filepath.Dir(casePath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(case dir): %v", err)
+	}
+	if err := os.WriteFile(casePath, []byte(`import { CaseTags } from '@testData/index';
+import { commonAfter } from '@utils/index';
+
+test("x", async () => {
+  console.log(CaseTags.P1, commonAfter);
+})`), 0o644); err != nil {
+		t.Fatalf("WriteFile(case): %v", err)
+	}
+
+	analysis := &types.FullAnalysis{
+		FilePath:   casePath,
+		TargetPath: filepath.Join(cfg.Target.BaseDir, "e2e", "tests", "brand", "case.spec.ts"),
+		Language:   "typescript",
+		ResolvedSymbolDeps: []types.ResolvedSymbolDependency{
+			{
+				ImportPath:        "@testData/index",
+				ImportSpec:        "{ CaseTags }",
+				ImportedName:      "CaseTags",
+				ExportFile:        filepath.Join(dir, "e2e", "test_data", "index.ts"),
+				TargetFile:        filepath.Join(cfg.Target.BaseDir, "e2e", "test_data", "index.ts"),
+				DependencyKind:    "shared_data",
+				IsSharedPreferred: true,
+			},
+			{
+				ImportPath:        "@utils/index",
+				ImportSpec:        "{ commonAfter }",
+				ImportedName:      "commonAfter",
+				BarrelFile:        filepath.Join(dir, "e2e", "utils", "index.ts"),
+				ExportFile:        filepath.Join(dir, "e2e", "utils", "describe-before", "index.ts"),
+				TargetFile:        filepath.Join(cfg.Target.BaseDir, "e2e", "utils", "describe-before", "index.ts"),
+				DependencyKind:    "shared_hook",
+				IsSharedPreferred: true,
+			},
+		},
+	}
+
+	promptText, err := g.Generate(analysis)
+	if err != nil {
+		t.Fatalf("Generate returned error: %v", err)
+	}
+	if !strings.Contains(promptText, "共享符号依赖") {
+		t.Fatalf("prompt missing shared symbol dependency section: %s", promptText)
+	}
+	if !strings.Contains(promptText, "CaseTags") || !strings.Contains(promptText, "commonAfter") {
+		t.Fatalf("prompt missing shared symbol names: %s", promptText)
+	}
+	if !strings.Contains(promptText, "禁止在 case 内重定义") {
+		t.Fatalf("prompt missing no-inline shared symbol guidance: %s", promptText)
+	}
+	if !strings.Contains(promptText, filepath.Join(dir, "e2e", "utils", "describe-before", "index.ts")) {
+		t.Fatalf("prompt missing concrete export file path for shared hook: %s", promptText)
 	}
 }
 
@@ -436,6 +546,42 @@ func TestGenerateIncludesMinimalHelperMigrationScope(t *testing.T) {
 	}
 	if !strings.Contains(promptText, "adGroupPage.optimizationAndBiddingModule1MNBA") {
 		t.Fatalf("prompt missing helper receiver: %s", promptText)
+	}
+}
+
+func TestGenerateIncludesSharedDependencyReuseConstraints(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Target.BaseDir = filepath.Join(t.TempDir(), "target-repo")
+	g := NewGenerator(cfg)
+
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "e2e", "test_data", "mock-data.ts")
+	if err := os.MkdirAll(filepath.Dir(sourcePath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(source dir): %v", err)
+	}
+	if err := os.WriteFile(sourcePath, []byte(`export const MockFeatureEnabledResponseBrandAuction = { status: 200 };`), 0o644); err != nil {
+		t.Fatalf("WriteFile(source): %v", err)
+	}
+
+	analysis := &types.FullAnalysis{
+		FilePath:   sourcePath,
+		TargetPath: filepath.Join(cfg.Target.BaseDir, "e2e", "test_data", "mock-data.ts"),
+		Language:   "typescript",
+		TaskKind:   "dependency",
+	}
+
+	promptText, err := g.Generate(analysis)
+	if err != nil {
+		t.Fatalf("Generate returned error: %v", err)
+	}
+	if !strings.Contains(promptText, "共享依赖迁移任务") {
+		t.Fatalf("prompt missing dependency task constraint: %s", promptText)
+	}
+	if !strings.Contains(promptText, "不要把同一个 mock/常量在每个 case 内重复内联") {
+		t.Fatalf("prompt missing shared reuse constraint: %s", promptText)
+	}
+	if !strings.Contains(promptText, "先检查目标文件是否已经存在且内容可复用") {
+		t.Fatalf("prompt missing reuse-before-migrate constraint: %s", promptText)
 	}
 }
 

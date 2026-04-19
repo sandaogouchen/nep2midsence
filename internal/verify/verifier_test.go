@@ -37,6 +37,30 @@ exit 1
 	}
 }
 
+func TestCheckCompileSummarizesTypeScriptMissingModulesFromStdout(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "fake-tsc-stdout.sh")
+	script := `#!/bin/sh
+echo "src/pages/CampaignPage.ts(1,30): error TS2307: Cannot find module '@utils/coreComponents/BaseComponent' or its corresponding type declarations."
+exit 1
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(script): %v", err)
+	}
+
+	v := NewVerifier(dir, scriptPath, "")
+	ok, compileErr := v.checkCompile(filepath.Join(dir, "dummy.ts"))
+	if ok {
+		t.Fatalf("checkCompile should fail for fake TypeScript compile errors")
+	}
+	if !strings.Contains(compileErr, "missing modules") {
+		t.Fatalf("compileErr = %q, want missing modules summary", compileErr)
+	}
+	if !strings.Contains(compileErr, "BaseComponent") {
+		t.Fatalf("compileErr = %q, want stdout compile details included", compileErr)
+	}
+}
+
 func TestSummarizeTypeScriptCompileErrorsSuggestsHandlingSourceLocalAliasImports(t *testing.T) {
 	output := `src/case.ts(1,30): error TS2307: Cannot find module '@testData/index' or its corresponding type declarations.
 src/case.ts(2,30): error TS2307: Cannot find module '@utils/index' or its corresponding type declarations.

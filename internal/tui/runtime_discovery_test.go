@@ -147,6 +147,73 @@ export class CampaignPage {
 	}
 }
 
+func TestResolveImportedSymbolFollowsBarrelReExport(t *testing.T) {
+	dir := t.TempDir()
+
+	caseFile := filepath.Join(dir, "e2e", "tests", "brand", "case.spec.ts")
+	if err := os.MkdirAll(filepath.Dir(caseFile), 0o755); err != nil {
+		t.Fatalf("MkdirAll(case): %v", err)
+	}
+	if err := os.WriteFile(caseFile, []byte(`import { commonAfter } from "@utils/index";
+test("x", async () => {
+  void commonAfter;
+})`), 0o644); err != nil {
+		t.Fatalf("WriteFile(case): %v", err)
+	}
+
+	barrelFile := filepath.Join(dir, "e2e", "utils", "index.ts")
+	if err := os.MkdirAll(filepath.Dir(barrelFile), 0o755); err != nil {
+		t.Fatalf("MkdirAll(barrel): %v", err)
+	}
+	if err := os.WriteFile(barrelFile, []byte(`export * from './describe-before';`), 0o644); err != nil {
+		t.Fatalf("WriteFile(barrel): %v", err)
+	}
+
+	concreteFile := filepath.Join(dir, "e2e", "utils", "describe-before", "index.ts")
+	if err := os.MkdirAll(filepath.Dir(concreteFile), 0o755); err != nil {
+		t.Fatalf("MkdirAll(concrete): %v", err)
+	}
+	if err := os.WriteFile(concreteFile, []byte(`export const commonAfter = async () => {
+  console.log("real hook");
+};`), 0o644); err != nil {
+		t.Fatalf("WriteFile(concrete): %v", err)
+	}
+
+	tsconfigPath := filepath.Join(dir, "tsconfig.json")
+	if err := os.WriteFile(tsconfigPath, []byte(`{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@utils/*": ["./e2e/utils/*"]
+    }
+  }
+}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(tsconfig): %v", err)
+	}
+
+	tscp, err := config.LoadTsConfig(tsconfigPath)
+	if err != nil {
+		t.Fatalf("LoadTsConfig: %v", err)
+	}
+
+	dep, err := resolveImportedSymbol(caseFile, "@utils/index", "commonAfter", tscp)
+	if err != nil {
+		t.Fatalf("resolveImportedSymbol: %v", err)
+	}
+	if dep.BarrelFile != barrelFile {
+		t.Fatalf("BarrelFile = %q, want %q", dep.BarrelFile, barrelFile)
+	}
+	if dep.ExportFile != concreteFile {
+		t.Fatalf("ExportFile = %q, want %q", dep.ExportFile, concreteFile)
+	}
+	if dep.DependencyKind != "shared_hook" {
+		t.Fatalf("DependencyKind = %q, want %q", dep.DependencyKind, "shared_hook")
+	}
+	if !dep.IsSharedPreferred {
+		t.Fatal("expected shared hook dependency to be preferred as shared")
+	}
+}
+
 func TestScanExtendedDirectoriesIncludesInheritedNepFiles(t *testing.T) {
 	dir := t.TempDir()
 
