@@ -43,7 +43,7 @@ nep2midsence 是一个**全屏交互式 CLI**，用于将基于 nep 框架编写
 - **Go 1.21+**
 - **Node.js**（用于 TypeScript AST 提取，可选 — 不可用时自动回退到正则方案）
 - 以下 AI CLI 工具之一已安装并完成认证：
-  - [Coco (Claude Code CLI)](https://github.com/anthropics/claude-code) — 默认
+  - [Coco (Trae CLI)](https://github.com/anthropics/claude-code) — 默认
   - [Claude Code (`cc`)](https://github.com/anthropics/claude-code)
   - [Codex](https://github.com/openai/codex)
 
